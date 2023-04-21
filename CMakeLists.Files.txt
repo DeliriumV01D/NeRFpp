@@ -1,0 +1,40 @@
+cmake_minimum_required(VERSION 3.8)
+
+#project(NeRF++)
+
+include_directories(${CMAKE_SOURCE_DIR}/src)
+include_directories(${CMAKE_SOURCE_DIR}/src/Common)
+include_directories(${CMAKE_SOURCE_DIR}/src/LibTorchTraining)
+#include_directories("src/LibTorchTraining")
+
+set(SOURCES ${SOURCES}
+	src/LibTorchTraining/Trainable.cpp
+	src/NeRF.cpp
+	src/BaseNeRFRenderer.cpp
+	src/NeRFExecutor.cpp
+	src/main.cpp
+)
+
+set(HEADERS ${HEADERS}
+	src/json_fwd.hpp
+	src/json.hpp
+	src/load_blender.h
+	src/LibTorchTraining/TorchHeader.h
+	src/LibTorchTraining/Trainable.h
+	src/NeRF.h
+	src/BaseNeRFRenderer.h
+	src/NeRFExecutor.h
+	src/Common/TRandomInt.h
+)
+
+set(LIBS ${LIBS}
+	${OpenCV_LIBS}
+	${TORCH_LIBRARIES}
+)
+
+if(MSVC_IDE)
+	source_group("src" FILES ${Files_src})
+
+	source_group("" FILES CMakeLists.Files.txt)
+endif()
+
