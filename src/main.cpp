@@ -20,6 +20,31 @@ const std::string DATA_DIR = "..//data//nerf_synthetic//lego";
 
 void test()
 {
+	// Создание тензоров cdf и u
+	torch::Tensor cdf = torch::rand({ 96, 3 });
+	torch::Tensor u = torch::rand({ 96, 10 });
+
+	//searchsorted работает только с тензорами одинакового размера вот мы и сводим задачу к этому
+	auto inds = torch::searchsorted(cdf, u, false, true);
+	std::cout << inds << std::endl;
+
+	//// Создание тензоров cdf и u
+	//torch::Tensor cdf = torch::rand({ 96, 3 });
+	//torch::Tensor u = torch::rand({ 96, 3, 10 });
+
+	////searchsorted работает только с тензорами одинакового размера вот мы и сводим задачу к этому
+	//torch::Tensor inds = torch::zeros(u.sizes(), torch::kLong);
+	//for (int c = 0; c < u.sizes().back(); c++)
+	//{
+	//	auto y = u.index({ "...", c });
+	//	auto ynds = torch::searchsorted(cdf, y, /*out_int32*/false, /*right=*/true);
+	//	std::cout << "k " << y.sizes() << " " << y.type() << std::endl;
+	//	std::cout << "ynds " << ynds.sizes() << " " << ynds.type() << std::endl;
+	//	inds.index_put_({ "...", c }, ynds);
+	//}
+	//std::cout << inds << std::endl;
+
+
 	auto aa = torch::arange(9, torch::kFloat32) - 4;
 	auto bb = aa.reshape({ 3, 3 });
 	auto cc = torch::reshape(aa, { -1, 3 });
@@ -59,7 +84,7 @@ void test()
 	sz.push_back(10);
 	c10::IntArrayRef rsz(&(*sz.begin()), &(*sz.cend()));
 	std::cout << "rsz: " << rsz << std::endl;
-	sz = f.sizes().vec();		//����� �������� ������
+	sz = f.sizes().vec();		//Более красивый способ
 	sz.pop_back();
 	sz.push_back(10);
 	std::cout << "sz: " << sz << std::endl;
@@ -73,7 +98,7 @@ void test()
 
 	torch::Tensor t2 = torch::tensor({ {1, 2}, {3, 4} });
 	torch::Tensor t3 = torch::tensor({ {5, 6}, {7, 8} });
-	torch::Tensor t1 = t2 * t3;			//������������ ���������
+	torch::Tensor t1 = t2 * t3;			//Поэлементное умножение
 	std::cout << t1 << std::endl;
 	// Output: tensor([[ 5, 12],
 	//                 [21, 32]])
@@ -142,7 +167,7 @@ int main(int argc, const char* argv[])
 		/*multires =*/ 10,
 		/*use_viewdirs =*/ true,	//use full 5D input instead of 3D
 		/*multires_views =*/ 4,		//log2 of max freq for positional encoding (2D direction)
-		/*n_importance =*/ 0,			//number of additional fine samples per ray
+		/*n_importance =*/ 192,			//number of additional fine samples per ray
 		/*net_depth_fine =*/ 8,		//layers in fine network
 		/*net_width_fine =*/ 256,	//channels per layer in fine network
 		/*device =*/ torch::kCUDA,
@@ -159,9 +184,10 @@ int main(int argc, const char* argv[])
 	params.Ndc = true;							//use normalized device coordinates (set for non-forward facing scenes)
 	params.LinDisp = false;					//sampling linearly in disparity rather than depth
 	params.NoBatching = true;				//only take random rays from 1 image at a time
-	params.Chunk = 1024 * 32;				//number of rays processed in parallel, decrease if running out of memory
+	params.Chunk = 1024 * 8/*16*/;				//number of rays processed in parallel, decrease if running out of memory
+	params.NetChunk = 1024 * 32/*32*/,		//number of pts sent through network in parallel, decrease if running out of memory
 	params.NSamples = 64;						//number of coarse samples per ray
-	params.NRand = 32 * 32 * 4;			//batch size (number of random rays per gradient step)
+	params.NRand = 32 * 32 * 1/*4*/;			//batch size (number of random rays per gradient step)
 	params.PrecorpIters = 0;				//number of steps to train on central crops
 	params.LRateDecay = 250;				//exponential learning rate decay (in 1000 steps)
 	//logging / saving options

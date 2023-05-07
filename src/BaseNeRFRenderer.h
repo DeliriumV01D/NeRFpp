@@ -76,7 +76,7 @@ inline torch::Tensor RunNetwork(
 	Embedder embeddirs_fn,
 	const int net_chunk = 1024 * 64
 ) {
-	//можно попробовать научить работать эмбедер с батчами чтобы не плющить тензоры?
+	//РјРѕР¶РЅРѕ РїРѕРїСЂРѕР±РѕРІР°С‚СЊ РЅР°СѓС‡РёС‚СЊ СЂР°Р±РѕС‚Р°С‚СЊ СЌРјР±РµРґРµСЂ СЃ Р±Р°С‚С‡Р°РјРё С‡С‚РѕР±С‹ РЅРµ РїР»СЋС‰РёС‚СЊ С‚РµРЅР·РѕСЂС‹?
 	torch::Tensor inputs_flat = torch::reshape(inputs, { -1, inputs.sizes().back()/*[-1]*/ });
 	torch::Tensor embedded = embed_fn->forward(inputs_flat);
 
@@ -147,11 +147,12 @@ inline RenderResult RenderRays(
 	const float perturb = 0.f,							///0. or 1. If non - zero, each ray is sampled at stratified random points in time.
 	const int n_importance = 0,							///Number of additional times to sample along each ray.
 	const bool white_bkgr = false,					///If True, assume a white background.
-	const float raw_noise_std = 0.
+	const float raw_noise_std = 0.,
+	const int net_chunk = 1024 * 64					///number of pts sent through network in parallel, decrease if running out of memory
 ) {
-	torch::Device device = ray_batch.device();		//Передать параметром??
+	torch::Device device = ray_batch.device();		//РџРµСЂРµРґР°С‚СЊ РїР°СЂР°РјРµС‚СЂРѕРј??
 	RenderResult result;
-	///!!!Можно просто передавать структурку не парсить тензор
+	///!!!РњРѕР¶РЅРѕ РїСЂРѕСЃС‚Рѕ РїРµСЂРµРґР°РІР°С‚СЊ СЃС‚СЂСѓРєС‚СѓСЂРєСѓ РЅРµ РїР°СЂСЃРёС‚СЊ С‚РµРЅР·РѕСЂ
 	int nrays = ray_batch.sizes()[0];
 	auto rays_o = ray_batch.index({ torch::indexing::Slice(), torch::indexing::Slice(0, 3) });			//[N_rays, 3]
 	auto rays_d = ray_batch.index({ torch::indexing::Slice(), torch::indexing::Slice(3, 6) });			//[N_rays, 3]
@@ -185,7 +186,7 @@ inline RenderResult RenderRays(
 	}
 
 	auto pts = rays_o.index({ "...", torch::indexing::None, torch::indexing::Slice() }) + rays_d.index({ "...", torch::indexing::None, torch::indexing::Slice() }) * z_vals.index({ "...", torch::indexing::Slice(), torch::indexing::None}); //[N_rays, N_samples, 3]
-	torch::Tensor raw = RunNetwork(pts, viewdirs, nerf, embed_fn, embeddirs_fn);
+	torch::Tensor raw = RunNetwork(pts, viewdirs, nerf, embed_fn, embeddirs_fn, net_chunk);
 	result.Outputs1 = RawToOutputs(raw, z_vals, rays_d, raw_noise_std, white_bkgr);
 
 	if (n_importance > 0)
@@ -200,9 +201,9 @@ inline RenderResult RenderRays(
 
 		if (network_fine)
 		{
-			raw = RunNetwork(pts, viewdirs, nerf, embed_fn, embeddirs_fn);
+			raw = RunNetwork(pts, viewdirs, nerf, embed_fn, embeddirs_fn, net_chunk);
 		}	else {
-			raw = RunNetwork(pts, viewdirs, network_fine, embed_fn, embeddirs_fn);
+			raw = RunNetwork(pts, viewdirs, network_fine, embed_fn, embeddirs_fn, net_chunk);
 		}
 		result.Outputs1 = RawToOutputs(raw, z_vals, rays_d, raw_noise_std, white_bkgr);
 		result.ZStd = torch::std(z_samples, -1, false);  // [N_rays]
@@ -216,7 +217,7 @@ inline RenderResult RenderRays(
 
 
 ///Render rays in smaller minibatches to save memory
-///rays_flat.sizes()[0] должно быть кратно размеру chunk
+///rays_flat.sizes()[0] РґРѕР»Р¶РЅРѕ Р±С‹С‚СЊ РєСЂР°С‚РЅРѕ СЂР°Р·РјРµСЂСѓ chunk
 inline RenderResult BatchifyRays(
 	torch::Tensor rays_flat,			///All information necessary for sampling along a ray, including : ray origin, ray direction, min dist, max dist, and unit - magnitude viewing direction.
 	NeRF nerf,
@@ -225,6 +226,7 @@ inline RenderResult BatchifyRays(
 	NeRF network_fine,											///"fine" network with same spec as network_fn.
 	const int n_samples,
 	const int chunk = 1024 * 32,						///Maximum number of rays to process simultaneously.Used to control maximum memory usage.Does not affect final results.
+	const int net_chunk = 1024 * 64,				///number of pts sent through network in parallel, decrease if running out of memory
 	const bool return_raw = false,					///If True, include model's raw, unprocessed predictions.
 	const bool lin_disp = false,						///If True, sample linearly in inverse depth rather than in depth.
 	const float perturb = 0.f,							///0. or 1. If non - zero, each ray is sampled at stratified random points in time.
@@ -248,9 +250,10 @@ inline RenderResult BatchifyRays(
 			perturb,
 			n_importance,
 			white_bkgr,
-			raw_noise_std
+			raw_noise_std,
+			net_chunk
 		));
-	//Слить all_results в один RenderResult используя torch::cat(torch::TensorList - at::ArrayRef ...
+	//РЎР»РёС‚СЊ all_results РІ РѕРґРёРЅ RenderResult РёСЃРїРѕР»СЊР·СѓСЏ torch::cat(torch::TensorList - at::ArrayRef ...
 	//!!!make this part cleaner and shorter
 	std::vector <torch::Tensor> out_rgb_map,
 		out_disp_map,
@@ -295,17 +298,18 @@ inline RenderResult BatchifyRays(
 	return result;
 }
 
-///Если определены позиции c2w то rays не нужен т.к.не используется (задавать либо pose c2w либо rays)
+///Р•СЃР»Рё РѕРїСЂРµРґРµР»РµРЅС‹ РїРѕР·РёС†РёРё c2w С‚Рѕ rays РЅРµ РЅСѓР¶РµРЅ С‚.Рє.РЅРµ РёСЃРїРѕР»СЊР·СѓРµС‚СЃСЏ (Р·Р°РґР°РІР°С‚СЊ Р»РёР±Рѕ pose c2w Р»РёР±Рѕ rays)
 inline RenderResult Render(
 	const int h,					///Height of image in pixels.
 	const int w,					///Width of image in pixels.
-	torch::Tensor k,			///Сamera calibration
+	torch::Tensor k,			///РЎamera calibration
 	NeRF nerf,
 	Embedder embed_fn,
 	Embedder embeddirs_fn,
 	NeRF network_fine,											///"fine" network with same spec as network_fn.
 	const int n_samples,
 	const int chunk = 1024 * 32,						///Maximum number of rays to process simultaneously.Used to control maximum memory usage.Does not affect final results.
+	const int net_chunk = 1024 * 64,				///number of pts sent through network in parallel, decrease if running out of memory
 	const bool return_raw = false,					///If True, include model's raw, unprocessed predictions.
 	const bool lin_disp = false,						///If True, sample linearly in inverse depth rather than in depth.
 	const float perturb = 0.f,							///0. or 1. If non - zero, each ray is sampled at stratified random points in time.
@@ -365,14 +369,14 @@ inline RenderResult Render(
 
 	//Renderand reshape
 	RenderResult all_ret = BatchifyRays(
-		rays_, nerf, embed_fn, embeddirs_fn, network_fine, n_samples, chunk, return_raw, lin_disp, perturb, n_importance, white_bkgr, raw_noise_std
+		rays_, nerf, embed_fn, embeddirs_fn, network_fine, n_samples, chunk, net_chunk, return_raw, lin_disp, perturb, n_importance, white_bkgr, raw_noise_std
 	);
 
 	if (all_ret.Outputs1.RGBMap.numel() != 0)
 		all_ret.Outputs1.RGBMap = torch::reshape(all_ret.Outputs1.RGBMap, sh);		//[640000, 3] -> [800, 800, 3]
 	if (all_ret.Outputs0.RGBMap.numel() != 0)
 		all_ret.Outputs0.RGBMap = torch::reshape(all_ret.Outputs0.RGBMap, sh);
-	if (sh.size() > 2)			//не [4096, 3] а [800,800,3]
+	if (sh.size() > 2)			//РЅРµ [4096, 3] Р° [800,800,3]
 	{
 		if (all_ret.Outputs1.DispMap.numel() != 0)
 			all_ret.Outputs1.DispMap = torch::reshape(all_ret.Outputs1.DispMap, { sh[0], sh[1] });	//[640000] -> [800,800]

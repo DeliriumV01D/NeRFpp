@@ -15,26 +15,27 @@ enum class DatasetType { LLFF, BLENDER, LINEMOD, DEEP_VOXELS };
 
 struct NeRFExecutorTrainParams {
 	DatasetType DatasetType = DatasetType::BLENDER;
-	std::filesystem::path DataDir,	//input data directory
-		BaseDir;											//where to store ckpts and logs
-	bool HalfRes{ false },					//load blender synthetic data at 400x400 instead of 800x800
-		TestSkip{ false },						//will load 1/N images from test/val sets, useful for large datasets like deepvoxels
-		WhiteBkgr{ false },						//set to render synthetic data on a white bkgd (always use for dvoxels)
-		RenderOnly{ false },					//do not optimize, reload weights and render out render_poses path
-		Ndc{ true },									//use normalized device coordinates (set for non-forward facing scenes)
-		LinDisp{ false },							//sampling linearly in disparity rather than depth
-		NoBatching{ true };						//only take random rays from 1 image at a time
-	int Chunk{ 1024 * 32 },					//number of rays processed in parallel, decrease if running out of memory
-		NSamples{ 64 },								//number of coarse samples per ray
-		NRand{ 32 * 32 * 4 },					//batch size (number of random rays per gradient step) must be < H * W
-		PrecorpIters{ 0 },						//number of steps to train on central crops
-		LRateDecay{ 250 },						//exponential learning rate decay (in 1000 steps)
+	std::filesystem::path DataDir,	///input data directory
+		BaseDir;											///where to store ckpts and logs
+	bool HalfRes{ false },					///load blender synthetic data at 400x400 instead of 800x800
+		TestSkip{ false },						///will load 1/N images from test/val sets, useful for large datasets like deepvoxels
+		WhiteBkgr{ false },						///set to render synthetic data on a white bkgd (always use for dvoxels)
+		RenderOnly{ false },					///do not optimize, reload weights and render out render_poses path
+		Ndc{ true },									///use normalized device coordinates (set for non-forward facing scenes)
+		LinDisp{ false },							///sampling linearly in disparity rather than depth
+		NoBatching{ true };						///only take random rays from 1 image at a time
+	int Chunk{ 1024 * 32 },					///number of rays processed in parallel, decrease if running out of memory
+		NetChunk{ 1024 * 64 },				///number of pts sent through network in parallel, decrease if running out of memory
+		NSamples{ 64 },								///number of coarse samples per ray
+		NRand{ 32 * 32 * 4 },					///batch size (number of random rays per gradient step) must be < H * W
+		PrecorpIters{ 0 },						///number of steps to train on central crops
+		LRateDecay{ 250 },						///exponential learning rate decay (in 1000 steps)
 		//logging / saving options
-		IPrint{ 100 },			//frequency of console printout and metric loggin
-		IImg{ 500 },				//frequency of tensorboard image logging
-		IWeights{ 10000 },	//frequency of weight ckpt saving
-		ITestset{ 50000 },	//frequency of testset saving
-		IVideo{ 50000 };		//frequency of render_poses video saving
+		IPrint{ 100 },			///frequency of console printout and metric loggin
+		IImg{ 500 },				///frequency of tensorboard image logging
+		IWeights{ 10000 },	///frequency of weight ckpt saving
+		ITestset{ 50000 },	///frequency of testset saving
+		IVideo{ 50000 };		///frequency of render_poses video saving
 	bool ReturnRaw{ false };
 	float RenderFactor{ 0 },
 		PrecorpFrac{ 0.5f };
@@ -78,6 +79,7 @@ public:
 		torch::Tensor k,
 		const int n_samples,
 		const int chunk = 1024 * 32,						///Maximum number of rays to process simultaneously.Used to control maximum memory usage.Does not affect final results.
+		const int net_chunk = 1024 * 64,				///number of pts sent through network in parallel, decrease if running out of memory
 		const bool return_raw = false,					///If True, include model's raw, unprocessed predictions.
 		const bool lin_disp = false,						///If True, sample linearly in inverse depth rather than in depth.
 		const float perturb = 0.f,							///0. or 1. If non - zero, each ray is sampled at stratified random points in time.
@@ -172,7 +174,7 @@ public:
 			std::cout << "test_poses_shape: " << data.RenderPoses.size() << std::endl;
 
 			//test args: perturb = False, raw_noise_std = 0.
-			auto [rgbs, disps] = RenderPath(data.RenderPoses, data.H, data.W, data.Focal, k, params.NSamples, params.Chunk, 
+			auto [rgbs, disps] = RenderPath(data.RenderPoses, data.H, data.W, data.Focal, k, params.NSamples, params.Chunk, params.NetChunk,
 				params.ReturnRaw, params.LinDisp, 0, NImportance, params.WhiteBkgr, 0., { torch::Tensor(), torch::Tensor() }, 
 				params.Ndc, near, far, UseViewDirs, /*c2w_staticcam*/torch::Tensor(), /*data.Imgs,*/ test_save_dir, params.RenderFactor
 				);
@@ -315,7 +317,7 @@ public:
 
 			RenderResult rgb_disp_acc_extras = Render(
 				data.H, data.W, k, Model, ExecutorEmbedder, ExecutorEmbeddirs, ModelFine,
-				params.NSamples, params.Chunk, params.ReturnRaw, params.LinDisp,
+				params.NSamples, params.Chunk, params.NetChunk, params.ReturnRaw, params.LinDisp,
 				0,		//0. or 1. If non - zero, each ray is sampled at stratified random points in time.
 				NImportance,
 				params.WhiteBkgr,
@@ -330,7 +332,7 @@ public:
 			Optimizer->zero_grad();
 			auto img_loss = torch::mse_loss(rgb_disp_acc_extras.Outputs1.RGBMap, target_s);
 			if (params.ReturnRaw)
-				auto trans = rgb_disp_acc_extras.Raw.index({ "...", -1});		//!!!последний элемент последнего измерения тензора
+				auto trans = rgb_disp_acc_extras.Raw.index({ "...", -1});		//последний элемент последнего измерения тензора
 			auto loss = img_loss;
 			auto psnr = -10. * torch::log(img_loss) / torch::log(torch::full({1/*img_loss.sizes()*/}, /*value=*/10.f)).to(Device);
 
@@ -340,7 +342,7 @@ public:
 			{
 				img_loss0 = torch::mse_loss(rgb_disp_acc_extras.Outputs0.RGBMap, target_s);
 				loss = loss + img_loss0;
-				psnr0 = -10. * torch::log(img_loss0) / torch::log(torch::full({ 1/*img_loss.sizes()*/ }, /*value=*/10.f));
+				psnr0 = -10. * torch::log(img_loss0) / torch::log(torch::full({ 1/*img_loss.sizes()*/ }, /*value=*/10.f)).to(Device);
 			}
 
 			loss.backward();
@@ -372,7 +374,7 @@ public:
 				torch::NoGradGuard no_grad;
 
 				//test args: perturb = False, raw_noise_std = 0.
-				auto [rgbs, disps] = RenderPath(data.RenderPoses, data.H, data.W, data.Focal, k, params.NSamples, params.Chunk,
+				auto [rgbs, disps] = RenderPath(data.RenderPoses, data.H, data.W, data.Focal, k, params.NSamples, params.Chunk, params.NetChunk,
 					params.ReturnRaw, params.LinDisp, 0, NImportance, params.WhiteBkgr, 0., { torch::Tensor(), torch::Tensor() },
 					params.Ndc, near, far, UseViewDirs, /*c2w_staticcam*/torch::Tensor()/*, data.Imgs,*/ /*params.TestSaveDir, params.RenderFactor*/
 				);
@@ -413,7 +415,7 @@ public:
 					//test_imgs.push_back(data.Imgs[k]);
 					test_poses.push_back(data.Poses[k].to(Device));
 				}
-				auto [rgbs, disps] = RenderPath(test_poses/*poses[i_test]).to(device)*/, data.H, data.W, data.Focal, k, params.NSamples, params.Chunk,
+				auto [rgbs, disps] = RenderPath(test_poses/*poses[i_test]).to(device)*/, data.H, data.W, data.Focal, k, params.NSamples, params.Chunk, params.NetChunk,
 					params.ReturnRaw, params.LinDisp, 0, NImportance, params.WhiteBkgr, 0., { torch::Tensor(), torch::Tensor() },
 					params.Ndc, near, far, UseViewDirs, /*c2w_staticcam*/torch::Tensor(), /*test_imgs,*/ test_save_dir, params.RenderFactor
 				);

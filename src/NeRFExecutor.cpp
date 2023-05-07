@@ -45,7 +45,7 @@ NeRFExecutor :: NeRFExecutor(
 
 	Optimizer = std::make_unique<torch::optim::Adam>(GradVars, torch::optim::AdamOptions(learning_rate)/*.weight_decay(0.001)*/.betas(std::make_tuple(0.9, 0.999)));
 
-	if (/*Проверить наличие файлов*/
+	if (/*РџСЂРѕРІРµСЂРёС‚СЊ РЅР°Р»РёС‡РёРµ С„Р°Р№Р»РѕРІ*/
 		std::filesystem::exists(ft_path / "start_checkpoint.pt") &&
 		std::filesystem::exists(ft_path / "optimizer_checkpoint.pt") &&
 		std::filesystem::exists(ft_path / "model_checkpoint.pt") &&
@@ -75,6 +75,7 @@ std::pair<std::vector<torch::Tensor>, std::vector<torch::Tensor>> NeRFExecutor :
 	torch::Tensor k,
 	const int n_samples,
 	const int chunk /*= 1024 * 32*/,						///Maximum number of rays to process simultaneously.Used to control maximum memory usage.Does not affect final results.
+	const int net_chunk /*= 1024 * 64*/,				///number of pts sent through network in parallel, decrease if running out of memory
 	const bool return_raw /*= false*/,					///If True, include model's raw, unprocessed predictions.
 	const bool lin_disp /*= false*/,						///If True, sample linearly in inverse depth rather than in depth.
 	const float perturb /*= 0.f*/,							///0. or 1. If non - zero, each ray is sampled at stratified random points in time.
@@ -112,6 +113,7 @@ std::pair<std::vector<torch::Tensor>, std::vector<torch::Tensor>> NeRFExecutor :
 			ModelFine,
 			n_samples,
 			chunk,
+			net_chunk,
 			return_raw,
 			lin_disp,
 			perturb,

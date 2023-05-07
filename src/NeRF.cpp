@@ -25,10 +25,10 @@ torch::Tensor EmbedderImpl :: forward(torch::Tensor x)
 	{
 		outputs = x;
 	}	else {
-		///!!!Надо как-то проинициалиировать outputs
+		///!!!РќР°РґРѕ РєР°Рє-С‚Рѕ РїСЂРѕРёРЅРёС†РёР°Р»РёРёСЂРѕРІР°С‚СЊ outputs
 	}
 
-	//!!!Подготовить все массивы и разом объединить  как в BatchifyRays
+	//!!!РџРѕРґРіРѕС‚РѕРІРёС‚СЊ РІСЃРµ РјР°СЃСЃРёРІС‹ Рё СЂР°Р·РѕРј РѕР±СЉРµРґРёРЅРёС‚СЊ  РєР°Рє РІ BatchifyRays
 	for (auto& freq : FreqBands)
 	{
 		outputs = torch::cat({ outputs, torch::sin(x * freq) }, -1);
@@ -126,20 +126,20 @@ torch::Tensor NeRFImpl :: forward(torch::Tensor x) //override
 	return outputs;
 }
 
-///x.sizes()[0] должно быть кратно размеру chunk
-torch::Tensor NeRFImpl :: Batchify(torch::Tensor x, const int chunk)
+///x.sizes()[0] РґРѕР»Р¶РЅРѕ Р±С‹С‚СЊ РєСЂР°С‚РЅРѕ СЂР°Р·РјРµСЂСѓ net_chunk
+torch::Tensor NeRFImpl :: Batchify(torch::Tensor x, const int net_chunk)
 {
 	torch::Tensor result;
 
-	if (chunk <= 0)
+	if (net_chunk <= 0 || net_chunk >= x.sizes()[0])
 		return forward(x);
 
-	for (int i = 0; i < x.sizes()[0]; i += chunk)
+	for (int i = 0; i < x.sizes()[0]; i += net_chunk)
 	{
 		if (i == 0)
-			result = forward(x.index({ torch::indexing::Slice(i, i + chunk) }));
+			result = forward(x.index({ torch::indexing::Slice(i, i + net_chunk) }));
 		else
-			result = torch::cat({ result, forward(x.index({ torch::indexing::Slice(i, i + chunk) })) }, 0);
+			result = torch::cat({ result, forward(x.index({ torch::indexing::Slice(i, i + net_chunk) })) }, 0);
 	}
 
 	return result;

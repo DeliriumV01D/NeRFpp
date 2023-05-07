@@ -55,32 +55,32 @@ inline std::pair<torch::Tensor, torch::Tensor> NDCRays(
 //Hierarchical sampling
 inline torch::Tensor SamplePDF(torch::Tensor bins, torch::Tensor weights, const int nsamples, const bool det = false)
 {
+	torch::Device device = weights.device();
 	//Get probability density function (PDF)
 	weights = weights + 1e-5;
 	auto pdf = weights / torch::sum(weights, -1, true);
 	auto cdf = torch::cumsum(pdf, -1);
-	cdf = torch::cat({ torch::zeros_like(cdf.index({ "...", torch::indexing::Slice(torch::indexing::None, 1)})), cdf }, -1);
+	cdf = torch::cat({ torch::zeros_like(cdf.index({ "...", torch::indexing::Slice(torch::indexing::None, 1)})), cdf }, -1);		//[batch, len(bins)]
 	torch::Tensor u;
-
 	//Take uniform samples
 	std::vector<int64_t> sz(cdf.sizes().begin(), cdf.sizes().end());
-	sz.push_back(nsamples);
+	sz.back() = nsamples;
 	if (det)
 	{
-		u = torch::linspace(0., 1., nsamples);
-		u = u.expand(c10::IntArrayRef(&(*sz.begin()), &(*sz.end())));
+		u = torch::linspace(0.f, 1.f, nsamples, torch::kFloat);
+		u = u.expand(sz);
 	}	else {
-		u = torch::rand(c10::IntArrayRef(&(*sz.begin()), &(*sz.end())));
+		u = torch::rand(sz);
 	}
 
 	//Invert cumulative distribution function (CDF)
-	u = u.contiguous();
-	auto inds = torch::searchsorted(cdf, u, false, true);
+	u = u.contiguous().to(device);
+	auto inds = torch::searchsorted(cdf, u, false, true);			
 	auto below = torch::max(torch::zeros_like(inds - 1), inds - 1);
 	auto above = torch::min((cdf.sizes().back() - 1) * torch::ones_like(inds), inds);
-	auto inds_g = torch::stack({ below, above }, -1);  //(batch, N_samples, 2);
+	auto inds_g = torch::stack({ below, above }, -1);  //[batch, N_samples, 2];
 
-	auto matched_shape = { inds_g.sizes()[0], inds_g.sizes()[1], cdf.sizes().back() };
+	std::vector< int64_t> matched_shape{ inds_g.sizes()[0], inds_g.sizes()[1], cdf.sizes().back() };
 	auto cdf_g = torch::gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g);
 	auto bins_g = torch::gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g);
 
@@ -144,7 +144,7 @@ struct NeRFImpl : public Trainable
 
 	virtual torch::Tensor forward(torch::Tensor x); //override
 
-	///x.sizes()[0] должно быть кратно размеру chunk
+	///x.sizes()[0] РґРѕР»Р¶РЅРѕ Р±С‹С‚СЊ РєСЂР°С‚РЅРѕ СЂР°Р·РјРµСЂСѓ chunk
 	virtual torch::Tensor Batchify(torch::Tensor x, const int chunk);
 };
 
