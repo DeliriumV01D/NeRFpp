@@ -5,5 +5,6 @@ NeRF original paper: https://arxiv.org/pdf/2003.08934.pdf
 PyTorch reference: https://github.com/yenchenlin/nerf-pytorch
 Dependencies: libTorch(https://pytorch.org), OpenCV(https://opencv.org/releases/), nlohmann json(https://github.com/nlohmann/json)
 
+![short](https://github.com/DeliriumV01D/NeRFpp/assets/46240032/2fefba98-404b-44ca-9069-63337dfe0ad4)
 
-![NeRFpp_short](https://user-images.githubusercontent.com/46240032/233819078-32ab2c20-5b8a-4ff8-9625-b94544422e24.gif)
+
