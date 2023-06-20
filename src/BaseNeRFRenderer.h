@@ -23,25 +23,6 @@ struct RenderResult
 		ZStd;							///Standard deviation of distances along ray for each sample.
 };
 
-//inline torch::Tensor CVMatToTorchTensor(cv::Mat frame)
-//{
-//	cv::cvtColor(frame, frame, cv::COLOR_BGR2RGB);
-//	frame.convertTo(frame, CV_32FC3/*, 1.0f / 255.0f*/);
-//	auto input_tensor = torch::from_blob(frame.data, { 1, frame.rows, frame.cols, 3 });
-//	input_tensor = input_tensor.permute({ 0, 3, 1, 2 });
-//	return input_tensor.div(255).toType(torch::kFloat);
-//}
-//
-///// !!!rename, COLOR_RGB2BGR - parameter, channels = ...
-//inline cv::Mat TorchTensorToCVMat(torch::Tensor tensor)
-//{
-//	tensor = tensor.squeeze().detach().permute({ 1, 2, 0 });
-//	tensor = tensor.mul(255).clamp(0, 255).to(torch::kU8);
-//	cv::Mat resultImg(tensor.size(0), tensor.size(1), CV_8UC3, tensor.data_ptr());
-//	cv::cvtColor(resultImg, resultImg, cv::COLOR_RGB2BGR);
-//	return resultImg;
-//}
-
 inline torch::Tensor CVMatToTorchTensor(cv::Mat img, const bool perm = false)
 {
 	auto tensor_image = torch::from_blob(img.data, { img.rows, img.cols, img.channels() }, at::kByte);
@@ -64,33 +45,37 @@ inline cv::Mat TorchTensorToCVMat(torch::Tensor tensor_image, const bool perm = 
 }
 
 ///Prepares inputs and applies network 'fn'.
-//template <class T, class E, class ED>
+template <class TEmbedder, class TEmbedDirs, class TNeRF>
 inline torch::Tensor RunNetwork(
 	torch::Tensor inputs,
 	torch::Tensor view_dirs,
-	//T fn,
-	//E embed_fn,
-	//ED embeddirs_fn,
-	NeRF fn,
-	Embedder embed_fn,
-	Embedder embeddirs_fn,
+	TNeRF fn,
+	TEmbedder embed_fn,
+	TEmbedDirs embeddirs_fn,
 	const int net_chunk = 1024 * 64
 ) {
 	//можно попробовать научить работать эмбедер с батчами чтобы не плющить тензоры?
-	torch::Tensor inputs_flat = torch::reshape(inputs, { -1, inputs.sizes().back()/*[-1]*/ });
-	torch::Tensor embedded = embed_fn->forward(inputs_flat);
+	torch::Tensor inputs_flat = torch::reshape(inputs, { -1, inputs.sizes().back()/*[-1]*/ });  //[1024, 256, 3] -> [262144, 3]
+	auto [embedded, keep_mask] = embed_fn->forward(inputs_flat);
 
-	torch::Tensor input_dirs = view_dirs.index({ torch::indexing::Slice(), torch::indexing::None }).expand(inputs.sizes());
-	torch::Tensor input_dirs_flat = torch::reshape(input_dirs, { -1, input_dirs.sizes().back()/*[-1]*/ });
-	torch::Tensor embedded_dirs = embeddirs_fn(input_dirs_flat);
-	embedded = torch::cat({ embedded, embedded_dirs }, -1);
+	if (view_dirs.defined() && view_dirs.numel() != 0)
+	{
+		torch::Tensor input_dirs = view_dirs.index({ torch::indexing::Slice(), torch::indexing::None }).expand(inputs.sizes());
+		torch::Tensor input_dirs_flat = torch::reshape(input_dirs, { -1, input_dirs.sizes().back()/*[-1]*/ });
+		auto [embedded_dirs, _] = embeddirs_fn(input_dirs_flat);
+		embedded = torch::cat({ embedded, embedded_dirs }, -1);
+	}
 
 	torch::Tensor outputs_flat = fn->Batchify(embedded, net_chunk);
+
+	//set sigma to 0 for invalid points
+	if (keep_mask.defined() && keep_mask.numel() != 0)
+		outputs_flat = outputs_flat.index_put_({ ~keep_mask, -1 }, 0);
 
 	std::vector<int64_t> sz = inputs.sizes().vec();
 	sz.pop_back();
 	sz.push_back(outputs_flat.sizes().back());
-	torch::Tensor outputs = torch::reshape(outputs_flat, sz);  //list(inputs.shape[:-1]) + [outputs_flat.shape[-1]]
+	torch::Tensor outputs = torch::reshape(outputs_flat, sz);  //list(inputs.shape[:-1]) + [outputs_flat.shape[-1]]  //[262144, 5] -> [1024, 256, 5]
 	return outputs;
 }
 
@@ -122,8 +107,8 @@ inline Outputs RawToOutputs(
 	).index({ torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, -1) });
 	result.RGBMap = torch::sum(result.Weights.index({ "...", torch::indexing::None }) * rgb, -2);  //[N_rays, 3]
 
-	result.DepthMap = torch::sum(result.Weights * z_vals, -1);
-	result.DispMap = 1. / torch::max(1e-10 * torch::ones_like(result.DepthMap), result.DepthMap / torch::sum(result.Weights, -1));
+	result.DepthMap = torch::sum(result.Weights * z_vals, -1) / torch::sum(result.Weights, -1);
+	result.DispMap = 1. / torch::max(1e-10 * torch::ones_like(result.DepthMap), result.DepthMap);
 	result.AccMap = torch::sum(result.Weights, -1);
 
 	if (white_bkgr)
@@ -133,14 +118,13 @@ inline Outputs RawToOutputs(
 }
 
 ///Volumetric rendering.
+template <class TEmbedder, class TEmbedDirs, class TNeRF>
 inline RenderResult RenderRays(
 	torch::Tensor ray_batch,		///All information necessary for sampling along a ray, including : ray origin, ray direction, min dist, max dist, and unit - magnitude viewing direction.
-	//network_fn								///function.Model for predicting RGBand density at each point in space.
-	//network_query_fn					///function used for passing queries to network_fn.
-	NeRF nerf,
-	Embedder embed_fn,
-	Embedder embeddirs_fn,
-	NeRF network_fine,											///"fine" network with same spec as network_fn.
+	TNeRF nerf,
+	TEmbedder embed_fn,
+	TEmbedDirs embeddirs_fn,
+	TNeRF network_fine,											///"fine" network with same spec as network_fn.
 	const int n_samples,
 	const bool return_raw = false,					///If True, include model's raw, unprocessed predictions.
 	const bool lin_disp = false,						///If True, sample linearly in inverse depth rather than in depth.
@@ -218,12 +202,13 @@ inline RenderResult RenderRays(
 
 ///Render rays in smaller minibatches to save memory
 ///rays_flat.sizes()[0] должно быть кратно размеру chunk
+template <class TEmbedder, class TEmbedDirs, class TNeRF>
 inline RenderResult BatchifyRays(
 	torch::Tensor rays_flat,			///All information necessary for sampling along a ray, including : ray origin, ray direction, min dist, max dist, and unit - magnitude viewing direction.
-	NeRF nerf,
-	Embedder embed_fn,
-	Embedder embeddirs_fn,
-	NeRF network_fine,											///"fine" network with same spec as network_fn.
+	TNeRF nerf,
+	TEmbedder embed_fn,
+	TEmbedDirs embeddirs_fn,
+	TNeRF network_fine,											///"fine" network with same spec as network_fn.
 	const int n_samples,
 	const int chunk = 1024 * 32,						///Maximum number of rays to process simultaneously.Used to control maximum memory usage.Does not affect final results.
 	const int net_chunk = 1024 * 64,				///number of pts sent through network in parallel, decrease if running out of memory
@@ -299,14 +284,15 @@ inline RenderResult BatchifyRays(
 }
 
 ///Если определены позиции c2w то rays не нужен т.к.не используется (задавать либо pose c2w либо rays)
+template <class TEmbedder, class TEmbedDirs, class TNeRF>
 inline RenderResult Render(
 	const int h,					///Height of image in pixels.
 	const int w,					///Width of image in pixels.
 	torch::Tensor k,			///Сamera calibration
-	NeRF nerf,
-	Embedder embed_fn,
-	Embedder embeddirs_fn,
-	NeRF network_fine,											///"fine" network with same spec as network_fn.
+	TNeRF nerf,
+	TEmbedder embed_fn,
+	TEmbedDirs embeddirs_fn,
+	TNeRF network_fine,											///"fine" network with same spec as network_fn.
 	const int n_samples,
 	const int chunk = 1024 * 32,						///Maximum number of rays to process simultaneously.Used to control maximum memory usage.Does not affect final results.
 	const int net_chunk = 1024 * 64,				///number of pts sent through network in parallel, decrease if running out of memory
@@ -387,14 +373,5 @@ inline RenderResult Render(
 		if (all_ret.Outputs0.DepthMap.numel() != 0)
 			all_ret.Outputs0.DepthMap = torch::reshape(all_ret.Outputs0.DepthMap, { sh[0], sh[1] });
 	}
-
 	return all_ret;
-
-	//for k in all_ret :
-	//	k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
-	//	all_ret[k] = torch.reshape(all_ret[k], k_sh)
-	//k_extract = ['rgb_map', 'disp_map', 'acc_map']
-	//ret_list = [all_ret[k] for k in k_extract]
-	//ret_dict = { k: all_ret[k] for k in all_ret if k not in k_extract }
-	//return ret_list + [ret_dict]
 }

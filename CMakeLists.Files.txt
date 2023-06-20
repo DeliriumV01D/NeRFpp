@@ -7,6 +7,10 @@ include_directories(${CMAKE_SOURCE_DIR}/src/Common)
 include_directories(${CMAKE_SOURCE_DIR}/src/LibTorchTraining)
 #include_directories("src/LibTorchTraining")
 
+#link_directories(
+#	"C:/Program Files (x86)/Intel/oneAPI/mkl/2022.1.0/lib/intel64"
+#)
+
 set(SOURCES ${SOURCES}
 	src/LibTorchTraining/Trainable.cpp
 	src/NeRF.cpp
@@ -25,6 +29,7 @@ set(HEADERS ${HEADERS}
 	src/BaseNeRFRenderer.h
 	src/NeRFExecutor.h
 	src/Common/TRandomInt.h
+	src/RayUtils.h
 )
 
 set(LIBS ${LIBS}
