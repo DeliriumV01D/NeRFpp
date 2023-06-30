@@ -29,6 +29,7 @@ struct NeRFExecutorTrainParams {
 		NSamples{ 64 },								///number of coarse samples per ray
 		NRand{ 32 * 32 * 4 },					///batch size (number of random rays per gradient step) must be < H * W
 		PrecorpIters{ 0 },						///number of steps to train on central crops
+		NIters {50000},
 		LRateDecay{ 250 },						///exponential learning rate decay (in 1000 steps)
 		//logging / saving options
 		IPrint{ 100 },			///frequency of console printout and metric loggin
@@ -208,8 +209,8 @@ NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: NeRFExecutor(
 
 	if constexpr (std::is_same_v<TNeRF, NeRFSmall>)	//!!!RAdam
 		//torch::optim::SGD generator_optimizer(generator->parameters(), torch::optim::SGDOptions(1e-4).weight_decay(0.001));
-		Optimizer = std::make_unique<torch::optim::Adam>(GradVars, torch::optim::AdamOptions(learning_rate).eps(1e-8)/*.weight_decay(1e-6)*/.betas(std::make_tuple(0.9, 0.999)));
-		//Optimizer = std::make_unique<torch::optim::Adam>(GradVars, torch::optim::AdamOptions(learning_rate).eps(1e-15).weight_decay(1e-6).betas(std::make_tuple(0.9, 0.99)));
+		//Optimizer = std::make_unique<torch::optim::Adam>(GradVars, torch::optim::AdamOptions(learning_rate).eps(1e-8)/*.weight_decay(1e-6)*/.betas(std::make_tuple(0.9, 0.999)));
+		Optimizer = std::make_unique<torch::optim::Adam>(GradVars, torch::optim::AdamOptions(learning_rate).eps(1e-15).betas(std::make_tuple(0.9, 0.99)));
 
 	if (/*Проверить наличие файлов*/
 		std::filesystem::exists(ft_path / "start_checkpoint.pt") &&
@@ -440,7 +441,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(NeRFExecutorTrainParam
 	}
 	torch::Tensor poses = torch::stack(data.Poses, 0).to(Device);
 
-	int n_iters = 200000 + 1;
+	int n_iters = params.NIters + 1;
 	std::cout << "Begin" << std::endl;
 	for (auto it : data.Splits)
 		std::cout << it << std::endl;
@@ -543,24 +544,24 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(NeRFExecutorTrainParam
 			psnr0 = -10. * torch::log(img_loss0) / torch::log(torch::full({ 1/*img_loss.sizes()*/ }, /*value=*/10.f)).to(Device);
 		}
 
-		////add Total Variation loss
-		//if constexpr (std::is_same_v<TEmbedder, HashEmbedder>)
-		//	if (i < 1000)
-		//	{
-		//		const float tv_loss_weight = 1e-6;
-		//		for (int level = 0; level < ExecutorEmbedder->GetNLevels(); level++)
-		//		{
-		//			loss += tv_loss_weight * TotalVariationLoss(
-		//				ExecutorEmbedder,
-		//				Device,
-		//				ExecutorEmbedder->GetBaseResolution(),
-		//				ExecutorEmbedder->GetFinestResolution(),
-		//				level,
-		//				ExecutorEmbedder->GetLog2HashmapSize(),
-		//				ExecutorEmbedder->GetNLevels()
-		//			).to(loss.device());
-		//		}
-		//	}
+		//add Total Variation loss
+		if constexpr (std::is_same_v<TEmbedder, HashEmbedder>)
+			if (i < 2000)
+			{
+				const float tv_loss_weight = 1e-6;
+				for (int level = 0; level < ExecutorEmbedder->GetNLevels(); level++)
+				{
+					loss += tv_loss_weight * TotalVariationLoss(
+						ExecutorEmbedder,
+						Device,
+						ExecutorEmbedder->GetBaseResolution(),
+						ExecutorEmbedder->GetFinestResolution(),
+						level,
+						ExecutorEmbedder->GetLog2HashmapSize(),
+						ExecutorEmbedder->GetNLevels()
+					).to(loss.device());
+				}
+			}
 
 		loss.backward();
 		Optimizer->step();

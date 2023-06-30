@@ -173,7 +173,7 @@ int main(int argc, const char* argv[])
 
 	NeRFExecutor <HashEmbedder, SHEncoder, NeRFSmall> nerf_executor(
 		/*net_depth =*/ 2,				//layers in network 8 for classic NeRF, 2/3 for HashNeRF
-		/*net_width =*/ 64,			//channels per layer 256 for classic NeRF, 64 for HashNeRF
+		/*net_width =*/ 64,				//channels per layer 256 for classic NeRF, 64 for HashNeRF
 		/*multires =*/ 10,
 		/*use_viewdirs =*/ false,	//use full 5D input instead of 3D Не всегда нужна зависимость от направления обзора + обучение быстрее процентов на 30.
 		/*multires_views =*/ 4,		//log2 of max freq for positional encoding (2D direction)
@@ -182,7 +182,7 @@ int main(int argc, const char* argv[])
 		/*net_width_fine =*/ 64,	//channels per layer in fine network 256 for classic NeRF, 64 for HashNeRF
 		/*num_layers_color =*/ 3,				//for color part of the HashNeRF
 		/*hidden_dim_color =*/ 64,			//for color part of the HashNeRF
-		/*num_layers_color_fine =*/ 4,	//for color part of the HashNeRF
+		/*num_layers_color_fine =*/ 3,	//for color part of the HashNeRF
 		/*hidden_dim_color_fine =*/ 64,	//for color part of the HashNeRF
 		/*bounding_box =*/ torch::tensor({-4.f, -4.f, -4.f, 4.f, 4.f, 4.f})/*.to(device)*/,
 		/*n_levels =*/ 16,
@@ -191,7 +191,7 @@ int main(int argc, const char* argv[])
 		/*base_resolution =*/ 16,
 		/*finest_resolution =*/ 512,
 		/*device =*/ torch::kCUDA,
-		/*learning_rate =*/ 1e-3,		//5e-4 for classic NeRF
+		/*learning_rate =*/ 1e-2,		//5e-4 for classic NeRF
 		/*ft_path =*/ "output"
 	);
 	NeRFExecutorTrainParams params;
@@ -209,13 +209,14 @@ int main(int argc, const char* argv[])
 	params.NSamples = 64;						//number of coarse samples per ray
 	params.NRand = 32 * 32 * 1/*4*/;			//batch size (number of random rays per gradient step)
 	params.PrecorpIters = 0;				//number of steps to train on central crops
-	params.LRateDecay = 250;				//exponential learning rate decay (in 1000 steps)  например: 150 - каждые 150000 итераций скорость обучения будет падать в 10 раз
+	params.NIters = 15100;
+	params.LRateDecay = 7;				//exponential learning rate decay (in 1000 steps)  например: 150 - каждые 150000 итераций скорость обучения будет падать в 10 раз
 	//logging / saving options
 	params.IPrint = 100;						//frequency of console printout and metric loggin
 	params.IImg = 500;							//frequency of tensorboard image logging
-	params.IWeights = 10000;				//frequency of weight ckpt saving
-	params.ITestset = 50000;				//frequency of testset saving
-	params.IVideo = 50000;					//frequency of render_poses video saving
+	params.IWeights = 15000;				//frequency of weight ckpt saving
+	params.ITestset = 15000;				//frequency of testset saving
+	params.IVideo = 15200;					//frequency of render_poses video saving
 	params.ReturnRaw = false;
 	params.RenderFactor = 0;
 	params.PrecorpFrac = 0.5f;
