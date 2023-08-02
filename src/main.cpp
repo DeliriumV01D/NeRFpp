@@ -171,29 +171,29 @@ int main(int argc, const char* argv[])
 
 	//test();
 
-	NeRFExecutor <HashEmbedder, SHEncoder, NeRFSmall> nerf_executor(
-		/*net_depth =*/ 2,				//layers in network 8 for classic NeRF, 2/3 for HashNeRF
-		/*net_width =*/ 64,				//channels per layer 256 for classic NeRF, 64 for HashNeRF
-		/*multires =*/ 10,
-		/*use_viewdirs =*/ false,	//use full 5D input instead of 3D Не всегда нужна зависимость от направления обзора + обучение быстрее процентов на 30.
-		/*multires_views =*/ 4,		//log2 of max freq for positional encoding (2D direction)
-		/*n_importance =*/ 192,		//number of additional fine samples per ray
-		/*net_depth_fine =*/ 2,		//layers in fine network 8 for classic NeRF, 2/3 for HashNeRF
-		/*net_width_fine =*/ 64,	//channels per layer in fine network 256 for classic NeRF, 64 for HashNeRF
-		/*num_layers_color =*/ 3,				//for color part of the HashNeRF
-		/*hidden_dim_color =*/ 64,			//for color part of the HashNeRF
-		/*num_layers_color_fine =*/ 3,	//for color part of the HashNeRF
-		/*hidden_dim_color_fine =*/ 64,	//for color part of the HashNeRF
-		/*bounding_box =*/ torch::tensor({-4.f, -4.f, -4.f, 4.f, 4.f, 4.f})/*.to(device)*/,
-		/*n_levels =*/ 16,
-		/*n_features_per_level =*/ 2,
-		/*log2_hashmap_size =*/ 19,		//19
-		/*base_resolution =*/ 16,
-		/*finest_resolution =*/ 512,
-		/*device =*/ torch::kCUDA,
-		/*learning_rate =*/ 1e-2,		//5e-4 for classic NeRF
-		/*ft_path =*/ "output"
-	);
+	NeRFExecutorParams exparams;
+	exparams.net_depth = 2;				//layers in network 8 for classic NeRF, 2/3 for HashNeRF
+	exparams.net_width = 64;				//channels per layer 256 for classic NeRF, 64 for HashNeRF
+	exparams.multires = 10;
+	exparams.use_viewdirs = false;	//use full 5D input instead of 3D Не всегда нужна зависимость от направления обзора + обучение быстрее процентов на 30.
+	exparams.multires_views = 4;		//log2 of max freq for positional encoding (2D direction)
+	exparams.n_importance = 192;		//number of additional fine samples per ray
+	exparams.net_depth_fine = 2;		//layers in fine network 8 for classic NeRF, 2/3 for HashNeRF
+	exparams.net_width_fine = 64;	//channels per layer in fine network 256 for classic NeRF, 64 for HashNeRF
+	exparams.num_layers_color = 3;				//for color part of the HashNeRF
+	exparams.hidden_dim_color = 64;			//for color part of the HashNeRF
+	exparams.num_layers_color_fine = 3;	//for color part of the HashNeRF
+	exparams.hidden_dim_color_fine = 64;	//for color part of the HashNeRF
+	exparams.n_levels = 16;
+	exparams.n_features_per_level = 2;
+	exparams.log2_hashmap_size = 19;		//19
+	exparams.base_resolution = 16;
+	exparams.finest_resolution = 512;
+	exparams.device = torch::kCUDA;
+	exparams.learning_rate = 1e-2;		//5e-4 for classic NeRF
+	exparams.ft_path = "output";
+	NeRFExecutor <HashEmbedder, SHEncoder, NeRFSmall> nerf_executor(exparams);
+
 	NeRFExecutorTrainParams params;
 	params.DatasetType = DatasetType::BLENDER;
 	params.DataDir = DATA_DIR;			//input data directory

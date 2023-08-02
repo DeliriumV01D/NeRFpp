@@ -13,6 +13,30 @@
 
 enum class DatasetType { LLFF, BLENDER, LINEMOD, DEEP_VOXELS };
 
+struct NeRFExecutorParams {
+	int net_depth{ 8 },				//layers in network 8 for classic NeRF, 2 for HashNeRF
+		net_width{ 256 },			//channels per layer 256 for classic NeRF, 64 for HashNeRF
+		multires{ 10 },
+		use_viewdirs{ true },	//use full 5D input instead of 3D. Не всегда нужна зависимость от направления обзора + обучение быстрее процентов на 30.
+		multires_views{ 4 },		//log2 of max freq for positional encoding (2D direction)
+		n_importance{ 0 },			//number of additional fine samples per ray
+		net_depth_fine{ 8 },		//layers in fine network 8 for classic NeRF, 2 for HashNeRF
+		net_width_fine{ 256 },	//channels per layer in fine network 256 for classic NeRF, 64 for HashNeRF
+		num_layers_color{ 4 },				//for color part of the HashNeRF
+		hidden_dim_color{ 64 },			//for color part of the HashNeRF
+		num_layers_color_fine{ 4 },	//for color part of the HashNeRF
+		hidden_dim_color_fine{ 64 };	//for color part of the HashNeRF
+	//torch::Tensor bounding_box = torch::tensor({ -4.f, -4.f, -4.f, 4.f, 4.f, 4.f });
+	int n_levels{ 16 },
+		n_features_per_level{ 2 },
+		log2_hashmap_size{ 19 },
+		base_resolution{ 16 },
+		finest_resolution{ 512 };
+	torch::Device device{ torch::kCUDA };
+	float learning_rate{ 5e-4 };
+	std::filesystem::path ft_path{ "" };
+};
+
 struct NeRFExecutorTrainParams {
 	DatasetType DatasetType = DatasetType::BLENDER;
 	std::filesystem::path DataDir,	///input data directory
@@ -46,6 +70,7 @@ struct NeRFExecutorTrainParams {
 template <typename TEmbedder, typename TEmbedDirs, typename TNeRF>
 class NeRFExecutor {
 protected:
+	NeRFExecutorParams Params;
 	TEmbedder ExecutorEmbedder = nullptr;
 	TEmbedDirs ExecutorEmbeddirs = nullptr;
 	TNeRF Model = nullptr,
@@ -58,29 +83,8 @@ protected:
 	torch::Device Device;
 	bool UseViewDirs;									//use full 5D input instead of 3D
 public:
-	NeRFExecutor(
-		const int net_depth = 8,				//layers in network 8 for classic NeRF, 2 for HashNeRF
-		const int net_width = 256,			//channels per layer 256 for classic NeRF, 64 for HashNeRF
-		const int multires = 10,
-		const bool use_viewdirs = true,	//use full 5D input instead of 3D. Не всегда нужна зависимость от направления обзора + обучение быстрее процентов на 30.
-		const int multires_views = 4,		//log2 of max freq for positional encoding (2D direction)
-		const int n_importance = 0,			//number of additional fine samples per ray
-		const int net_depth_fine = 8,		//layers in fine network 8 for classic NeRF, 2 for HashNeRF
-		const int net_width_fine = 256,	//channels per layer in fine network 256 for classic NeRF, 64 for HashNeRF
-		const int num_layers_color = 4,				//for color part of the HashNeRF
-		const int hidden_dim_color = 64,			//for color part of the HashNeRF
-		const int num_layers_color_fine = 4,	//for color part of the HashNeRF
-		const int hidden_dim_color_fine = 64,	//for color part of the HashNeRF
-		torch::Tensor bounding_box = torch::tensor({ 0.f, 0.f, 0.f, 1.f, 1.f, 1.f }),
-		const int n_levels = 16,
-		const int n_features_per_level = 2,
-		const int log2_hashmap_size = 19,
-		const int base_resolution = 16,
-		const int finest_resolution = 512,
-		torch::Device device = torch::kCUDA,
-		const float learning_rate = 5e-4,
-		std::filesystem::path ft_path = ""
-	);
+	NeRFExecutor(const NeRFExecutorParams &params) : Params(params), Device(params.device), NImportance(params.n_importance), UseViewDirs(params.use_viewdirs), LearningRate(params.learning_rate){};
+	void Initialize(const NeRFExecutorParams &params, torch::Tensor bounding_box);
 
 	///
 	std::pair<std::vector<torch::Tensor>, std::vector<torch::Tensor>> RenderPath(
@@ -116,43 +120,21 @@ public:
 
 ///if using hashed for xyz, use SH for views
 template <typename TEmbedder, typename TEmbedDirs, typename TNeRF>
-NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: NeRFExecutor(
-	const int net_depth /*= 8, num_layers = 2*/,
-	const int net_width /*= 256, hidden_dim = 64*/,
-	const int multires /*= 10, -*/,
-	const bool use_viewdirs /*= true*/,
-	const int multires_views /*= 4*/,
-	const int n_importance /*= 0*/,
-	const int net_depth_fine /*= 8, num_layers_fine = 2*/,
-	const int net_width_fine /*= 256, hidden_dim_fine = 64*/,
-	const int num_layers_color /*= 4*/,
-	const int hidden_dim_color /*= 64*/,
-	const int num_layers_color_fine /*= 4*/,
-	const int hidden_dim_color_fine /*= 64*/,
-	torch::Tensor bounding_box,
-	const int n_levels /*= 16*/,
-	const int n_features_per_level /*= 2*/,
-	const int log2_hashmap_size /*= 19*/,
-	const int base_resolution /*= 16*/,
-	const int finest_resolution /*= 512*/,
-	torch::Device device /*= torch::kCUDA*/,
-	const float learning_rate /*= 5e-4*/,
-	std::filesystem::path ft_path /*= ""*/
-) : Device(device), NImportance(n_importance), UseViewDirs(use_viewdirs), LearningRate(learning_rate)
+void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Initialize(const NeRFExecutorParams &params, torch::Tensor bounding_box)
 {
 	int input_ch,
 		input_ch_views = 0;
 	if constexpr (std::is_same_v<TEmbedder, Embedder>)
 		ExecutorEmbedder = Embedder("embedder", multires);
 	if constexpr (std::is_same_v<TEmbedder, HashEmbedder>)
-		ExecutorEmbedder = HashEmbedder("embedder", bounding_box.to(Device), n_levels, n_features_per_level, log2_hashmap_size, base_resolution, finest_resolution);
+		ExecutorEmbedder = HashEmbedder("embedder", bounding_box.to(Device), params.n_levels, params.n_features_per_level, params.log2_hashmap_size, params.base_resolution, params.finest_resolution);
 
-	ExecutorEmbedder->to(device);
+	ExecutorEmbedder->to(params.device);
 	input_ch = ExecutorEmbedder->GetOutputDims();
 	auto embp = ExecutorEmbedder->parameters();
 	GradVars.insert(GradVars.end(), std::make_move_iterator(embp.begin()), std::make_move_iterator(embp.end()));		//!!!
 	
-	if (use_viewdirs)
+	if (params.use_viewdirs)
 	{
 		if constexpr (std::is_same_v<TEmbedDirs, Embedder>)
 			ExecutorEmbeddirs = Embedder("embeddirs", multires_views);
@@ -161,10 +143,10 @@ NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: NeRFExecutor(
 		if constexpr (std::is_same_v<TEmbedDirs, SHEncoder>)
 			ExecutorEmbeddirs = SHEncoder("embeddirs", 3, 4);
 		input_ch_views = ExecutorEmbeddirs->GetOutputDims();
-		ExecutorEmbeddirs->to(device);
+		ExecutorEmbeddirs->to(params.device);
 	}
 
-	int output_ch = (n_importance > 0) ? 5 : 4;
+	int output_ch = (params.n_importance > 0) ? 5 : 4;
 	const std::set<int> skips = std::set<int>{ 4 };
 
 	if constexpr (std::is_same_v<TNeRF, NeRF>)
@@ -173,10 +155,10 @@ NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: NeRFExecutor(
 	if constexpr (std::is_same_v<TNeRF, NeRFSmall>)
 	{
 		int geo_feat_dim = 15;
-		Model = NeRFSmall(net_depth, net_width, geo_feat_dim, num_layers_color, hidden_dim_color, input_ch, input_ch_views, "model");
+		Model = NeRFSmall(params.net_depth, params.net_width, geo_feat_dim, params.num_layers_color, params.hidden_dim_color, input_ch, input_ch_views, "model");
 	}
 
-	Model->to(device);
+	Model->to(params.device);
 	auto mp = Model->parameters();
 	GradVars.insert(GradVars.end(), std::make_move_iterator(mp.begin()), std::make_move_iterator(mp.end()));		//!!!
 
@@ -184,7 +166,7 @@ NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: NeRFExecutor(
 		std::cout << k.key() << std::endl;
 	std::cout << "Model params count: " << Trainable::ParamsCount(Model) << std::endl;
 
-	if (n_importance > 0)
+	if (params.n_importance > 0)
 	{
 		if constexpr (std::is_same_v<TNeRF, NeRF>)
 			ModelFine = NeRF(net_depth_fine, net_width_fine, input_ch, input_ch_views, output_ch, skips, use_viewdirs, "model_fine");
@@ -192,10 +174,10 @@ NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: NeRFExecutor(
 		if constexpr (std::is_same_v<TNeRF, NeRFSmall>)
 		{
 			int geo_feat_dim = 15;
-			ModelFine = NeRFSmall(net_depth_fine, net_width_fine, geo_feat_dim, num_layers_color_fine, hidden_dim_color_fine, input_ch, input_ch_views, "model_fine");
+			ModelFine = NeRFSmall(params.net_depth_fine, params.net_width_fine, geo_feat_dim, params.num_layers_color_fine, params.hidden_dim_color_fine, input_ch, input_ch_views, "model_fine");
 		}
 
-		ModelFine->to(device);
+		ModelFine->to(params.device);
 		auto temp = ModelFine->parameters();
 		GradVars.insert(GradVars.end(), std::make_move_iterator(temp.begin()), std::make_move_iterator(temp.end()));
 
@@ -210,31 +192,31 @@ NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: NeRFExecutor(
 	if constexpr (std::is_same_v<TNeRF, NeRFSmall>)	//!!!RAdam
 		//torch::optim::SGD generator_optimizer(generator->parameters(), torch::optim::SGDOptions(1e-4).weight_decay(0.001));
 		//Optimizer = std::make_unique<torch::optim::Adam>(GradVars, torch::optim::AdamOptions(learning_rate).eps(1e-8)/*.weight_decay(1e-6)*/.betas(std::make_tuple(0.9, 0.999)));
-		Optimizer = std::make_unique<torch::optim::Adam>(GradVars, torch::optim::AdamOptions(learning_rate).eps(1e-15).betas(std::make_tuple(0.9, 0.99)));
+		Optimizer = std::make_unique<torch::optim::Adam>(GradVars, torch::optim::AdamOptions(params.learning_rate).eps(1e-15).betas(std::make_tuple(0.9, 0.99)));
 
 	if (/*Проверить наличие файлов*/
-		std::filesystem::exists(ft_path / "start_checkpoint.pt") &&
-		std::filesystem::exists(ft_path / "optimizer_checkpoint.pt") &&
-		std::filesystem::exists(ft_path / "model_checkpoint.pt") &&
-		(ModelFine.is_empty() || (!ModelFine.is_empty() && std::filesystem::exists(ft_path / "model_fine_checkpoint.pt")))
+		std::filesystem::exists(params.ft_path / "start_checkpoint.pt") &&
+		std::filesystem::exists(params.ft_path / "optimizer_checkpoint.pt") &&
+		std::filesystem::exists(params.ft_path / "model_checkpoint.pt") &&
+		(ModelFine.is_empty() || (!ModelFine.is_empty() && std::filesystem::exists(params.ft_path / "model_fine_checkpoint.pt")))
 	) {
 		if constexpr (std::is_same_v<TEmbedder, HashEmbedder>)
-			if (std::filesystem::exists(ft_path / "embedder_checkpoint.pt"))
-				torch::load(ExecutorEmbedder, (ft_path / "embedder_checkpoint.pt").string());
+			if (std::filesystem::exists(params.ft_path / "embedder_checkpoint.pt"))
+				torch::load(ExecutorEmbedder, (params.ft_path / "embedder_checkpoint.pt").string());
 
 		std::cout << "restoring parameters from checkpoint..." << std::endl;
 		torch::Tensor temp;
-		torch::load(temp, (ft_path / "start_checkpoint.pt").string());
+		torch::load(temp, (params.ft_path / "start_checkpoint.pt").string());
 		Start = temp.item<float>();
-		torch::load(*Optimizer.get(), (ft_path / "optimizer_checkpoint.pt").string());
-		torch::load(Model, (ft_path / "model_checkpoint.pt").string());
+		torch::load(*Optimizer.get(), (params.ft_path / "optimizer_checkpoint.pt").string());
+		torch::load(Model, (params.ft_path / "model_checkpoint.pt").string());
 		if (!ModelFine.is_empty())
-			torch::load(ModelFine, (ft_path / "model_fine_checkpoint.pt").string());
+			torch::load(ModelFine, (params.ft_path / "model_fine_checkpoint.pt").string());
 	} else {
 		if constexpr (std::is_same_v<TEmbedder, HashEmbedder>)
 			ExecutorEmbedder->Initialize();//Trainable::Initialize(ExecutorEmbedder);//ExecutorEmbedder->Initialize();
 		Trainable::Initialize(Model);
-		if (n_importance > 0)
+		if (params.n_importance > 0)
 			Trainable::Initialize(ModelFine);
 	}
 }			//NeRFExecutor :: NeRFExecutor
@@ -340,6 +322,8 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(NeRFExecutorTrainParam
 				img = img.index({ "...", torch::indexing::Slice(torch::indexing::None, 3) });
 		}
 	}
+
+	Initialize(this->Params, data.BoundingBox);
 
 	//Задать калибровки камеры
 	if (!k.defined())
