@@ -530,7 +530,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(NeRFExecutorTrainParam
 
 		//add Total Variation loss
 		if constexpr (std::is_same_v<TEmbedder, HashEmbedder>)
-			if (i < 2000)
+			if (i < n_iters/2)
 			{
 				const float tv_loss_weight = 1e-6;
 				for (int level = 0; level < ExecutorEmbedder->GetNLevels(); level++)

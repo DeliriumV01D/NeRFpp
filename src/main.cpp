@@ -175,14 +175,14 @@ int main(int argc, const char* argv[])
 	exparams.net_depth = 2;				//layers in network 8 for classic NeRF, 2/3 for HashNeRF
 	exparams.net_width = 64;				//channels per layer 256 for classic NeRF, 64 for HashNeRF
 	exparams.multires = 10;
-	exparams.use_viewdirs = false;	//use full 5D input instead of 3D Не всегда нужна зависимость от направления обзора + обучение быстрее процентов на 30.
+	exparams.use_viewdirs = true;	//use full 5D input instead of 3D Не всегда нужна зависимость от направления обзора + обучение быстрее процентов на 30.
 	exparams.multires_views = 4;		//log2 of max freq for positional encoding (2D direction)
 	exparams.n_importance = 192;		//number of additional fine samples per ray
 	exparams.net_depth_fine = 2;		//layers in fine network 8 for classic NeRF, 2/3 for HashNeRF
 	exparams.net_width_fine = 64;	//channels per layer in fine network 256 for classic NeRF, 64 for HashNeRF
-	exparams.num_layers_color = 3;				//for color part of the HashNeRF
+	exparams.num_layers_color = 2;				//for color part of the HashNeRF
 	exparams.hidden_dim_color = 64;			//for color part of the HashNeRF
-	exparams.num_layers_color_fine = 3;	//for color part of the HashNeRF
+	exparams.num_layers_color_fine = 2;	//for color part of the HashNeRF
 	exparams.hidden_dim_color_fine = 64;	//for color part of the HashNeRF
 	exparams.n_levels = 16;
 	exparams.n_features_per_level = 2;
@@ -209,14 +209,14 @@ int main(int argc, const char* argv[])
 	params.NSamples = 64;						//number of coarse samples per ray
 	params.NRand = 32 * 32 * 1/*4*/;			//batch size (number of random rays per gradient step)
 	params.PrecorpIters = 0;				//number of steps to train on central crops
-	params.NIters = 15100;
-	params.LRateDecay = 7;				//exponential learning rate decay (in 1000 steps)  например: 150 - каждые 150000 итераций скорость обучения будет падать в 10 раз
+	params.NIters = 10100;
+	params.LRateDecay = 5;				//exponential learning rate decay (in 1000 steps)  например: 150 - каждые 150000 итераций скорость обучения будет падать в 10 раз
 	//logging / saving options
 	params.IPrint = 100;						//frequency of console printout and metric loggin
 	params.IImg = 500;							//frequency of tensorboard image logging
-	params.IWeights = 15000;				//frequency of weight ckpt saving
-	params.ITestset = 15000;				//frequency of testset saving
-	params.IVideo = 15200;					//frequency of render_poses video saving
+	params.IWeights = 10000;				//frequency of weight ckpt saving
+	params.ITestset = 10000;				//frequency of testset saving
+	params.IVideo = 10200;					//frequency of render_poses video saving
 	params.ReturnRaw = false;
 	params.RenderFactor = 0;
 	params.PrecorpFrac = 0.5f;
