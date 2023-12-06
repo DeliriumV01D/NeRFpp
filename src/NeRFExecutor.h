@@ -15,18 +15,22 @@ enum class DatasetType { LLFF, BLENDER, LINEMOD, DEEP_VOXELS };
 
 struct NeRFExecutorParams {
 	int net_depth{ 8 },				//layers in network 8 for classic NeRF, 2 for HashNeRF
-		net_width{ 256 },			//channels per layer 256 for classic NeRF, 64 for HashNeRF
+		net_width{ 256 },				//channels per layer 256 for classic NeRF, 64 for HashNeRF
 		multires{ 10 },
-		use_viewdirs{ true },	//use full 5D input instead of 3D. Не всегда нужна зависимость от направления обзора + обучение быстрее процентов на 30.
 		multires_views{ 4 },		//log2 of max freq for positional encoding (2D direction)
 		n_importance{ 0 },			//number of additional fine samples per ray
 		net_depth_fine{ 8 },		//layers in fine network 8 for classic NeRF, 2 for HashNeRF
 		net_width_fine{ 256 },	//channels per layer in fine network 256 for classic NeRF, 64 for HashNeRF
 		num_layers_color{ 4 },				//for color part of the HashNeRF
-		hidden_dim_color{ 64 },			//for color part of the HashNeRF
-		num_layers_color_fine{ 4 },	//for color part of the HashNeRF
-		hidden_dim_color_fine{ 64 };	//for color part of the HashNeRF
+		hidden_dim_color{ 64 },				//for color part of the HashNeRF
+		num_layers_color_fine{ 4 },		//for color part of the HashNeRF
+		hidden_dim_color_fine{ 64 },	//for color part of the HashNeRF
+		num_layers_normals{ 3 },
+		hidden_dim_normals{ 64 };
 	//torch::Tensor bounding_box = torch::tensor({ -4.f, -4.f, -4.f, 4.f, 4.f, 4.f });
+	bool use_viewdirs{ true },	//use full 5D input instead of 3D. Не всегда нужна зависимость от направления обзора + обучение быстрее процентов на 30.
+		calculate_normals{ false },
+		use_pred_normal{ true };	//whether to use predicted normals
 	int n_levels{ 16 },
 		n_features_per_level{ 2 },
 		log2_hashmap_size{ 19 },
@@ -48,8 +52,7 @@ struct NeRFExecutorTrainParams {
 		Ndc{ true },									///use normalized device coordinates (set for non-forward facing scenes)
 		LinDisp{ false },							///sampling linearly in disparity rather than depth
 		NoBatching{ true };						///only take random rays from 1 image at a time
-	int Chunk{ 1024 * 32 },					///number of rays processed in parallel, decrease if running out of memory
-		NetChunk{ 1024 * 64 },				///number of pts sent through network in parallel, decrease if running out of memory
+	int Chunk{ 1024 * 32 },					///number of rays processed in parallel, decrease if running out of memory не влияет на качество
 		NSamples{ 64 },								///number of coarse samples per ray
 		NRand{ 32 * 32 * 4 },					///batch size (number of random rays per gradient step) must be < H * W
 		PrecorpIters{ 0 },						///number of steps to train on central crops
@@ -88,14 +91,13 @@ public:
 
 	///
 	std::pair<std::vector<torch::Tensor>, std::vector<torch::Tensor>> RenderPath(
-		const std::vector <torch::Tensor>& render_poses,
+		const std::vector <torch::Tensor> &render_poses,
 		int h,
 		int w,
 		float focal,
 		torch::Tensor k,
 		const int n_samples,
 		const int chunk = 1024 * 32,						///Maximum number of rays to process simultaneously.Used to control maximum memory usage.Does not affect final results.
-		const int net_chunk = 1024 * 64,				///number of pts sent through network in parallel, decrease if running out of memory
 		const bool return_raw = false,					///If True, include model's raw, unprocessed predictions.
 		const bool lin_disp = false,						///If True, sample linearly in inverse depth rather than in depth.
 		const float perturb = 0.f,							///0. or 1. If non - zero, each ray is sampled at stratified random points in time.
@@ -108,6 +110,8 @@ public:
 		const float near = 0.,						///float or array of shape[batch_size].Nearest distance for a ray.
 		const float far = 1.,							///float or array of shape[batch_size].Farthest distance for a ray.
 		const bool use_viewdirs = false,	///If True, use viewing direction of a point in space in model.
+		const bool calculate_normals = false,
+		const bool use_pred_normal = false,	///whether to use predicted normals
 		torch::Tensor c2w_staticcam = torch::Tensor(),			///array of shape[3, 4].If not None, use this transformation matrix for camera while using other c2w argument for viewing directions.
 		//torch::Tensor gt_imgs = torch::Tensor(),
 		const std::filesystem::path savedir = "",
@@ -155,7 +159,19 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Initialize(const NeRFExecuto
 	if constexpr (std::is_same_v<TNeRF, NeRFSmall>)
 	{
 		int geo_feat_dim = 15;
-		Model = NeRFSmall(params.net_depth, params.net_width, geo_feat_dim, params.num_layers_color, params.hidden_dim_color, input_ch, input_ch_views, "model");
+		Model = NeRFSmall(
+			params.net_depth,
+			params.net_width,
+			geo_feat_dim,
+			params.num_layers_color,
+			params.hidden_dim_color,
+			(params.n_importance == 0) && params.use_pred_normal,		//В грубой сети не учим нормали, поэтому проверим нет ли тонкой сети
+			params.num_layers_normals,
+			params.hidden_dim_normals,
+			input_ch,
+			input_ch_views,
+			"model"
+		);
 	}
 
 	Model->to(params.device);
@@ -174,7 +190,18 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Initialize(const NeRFExecuto
 		if constexpr (std::is_same_v<TNeRF, NeRFSmall>)
 		{
 			int geo_feat_dim = 15;
-			ModelFine = NeRFSmall(params.net_depth_fine, params.net_width_fine, geo_feat_dim, params.num_layers_color_fine, params.hidden_dim_color_fine, input_ch, input_ch_views, "model_fine");
+			ModelFine = NeRFSmall(
+				params.net_depth_fine,
+				params.net_width_fine,
+				geo_feat_dim, params.num_layers_color_fine,
+				params.hidden_dim_color_fine,
+				params.use_pred_normal,
+				params.num_layers_normals,
+				params.hidden_dim_normals,
+				input_ch,
+				input_ch_views,
+				"model_fine"
+			);
 		}
 
 		ModelFine->to(params.device);
@@ -231,7 +258,6 @@ std::pair<std::vector<torch::Tensor>, std::vector<torch::Tensor>> NeRFExecutor <
 	torch::Tensor k,
 	const int n_samples,
 	const int chunk /*= 1024 * 32*/,						///Maximum number of rays to process simultaneously.Used to control maximum memory usage.Does not affect final results.
-	const int net_chunk /*= 1024 * 64*/,				///number of pts sent through network in parallel, decrease if running out of memory
 	const bool return_raw /*= false*/,					///If True, include model's raw, unprocessed predictions.
 	const bool lin_disp /*= false*/,						///If True, sample linearly in inverse depth rather than in depth.
 	const float perturb /*= 0.f*/,							///0. or 1. If non - zero, each ray is sampled at stratified random points in time.
@@ -244,6 +270,8 @@ std::pair<std::vector<torch::Tensor>, std::vector<torch::Tensor>> NeRFExecutor <
 	const float near /*= 0.*/,						///float or array of shape[batch_size].Nearest distance for a ray.
 	const float far /*= 1.*/,							///float or array of shape[batch_size].Farthest distance for a ray.
 	const bool use_viewdirs /*= false*/,	///If True, use viewing direction of a point in space in model.
+	const bool calculate_normals /*= false*/,
+	const bool use_pred_normal /*= false*/,	///whether to use predicted normals
 	torch::Tensor c2w_staticcam /*= torch::Tensor()*/,			///array of shape[3, 4].If not None, use this transformation matrix for camera while using other c2w argument for viewing directions.
 	//torch::Tensor gt_imgs = torch::Tensor(),
 	const std::filesystem::path savedir /*= ""*/,
@@ -269,7 +297,6 @@ std::pair<std::vector<torch::Tensor>, std::vector<torch::Tensor>> NeRFExecutor <
 			ModelFine,
 			n_samples,
 			chunk,
-			net_chunk,
 			return_raw,
 			lin_disp,
 			perturb,
@@ -282,6 +309,8 @@ std::pair<std::vector<torch::Tensor>, std::vector<torch::Tensor>> NeRFExecutor <
 			near,
 			far,
 			use_viewdirs,
+			calculate_normals,
+			use_pred_normal,
 			c2w_staticcam
 		);
 		rgbs.push_back(render_result.Outputs1.RGBMap.cpu());
@@ -293,7 +322,15 @@ std::pair<std::vector<torch::Tensor>, std::vector<torch::Tensor>> NeRFExecutor <
 		{
 			cv::imwrite((savedir / (std::to_string(rgbs.size() - 1) + ".png")).string(), TorchTensorToCVMat(rgbs.back()));
 			cv::imwrite((savedir / ("disp_" + std::to_string(disps.size() - 1) + ".png")).string(), TorchTensorToCVMat(disps.back()));
-			cv::imwrite((savedir / ("depth_" + std::to_string(disps.size() - 1) + ".png")).string(), TorchTensorToCVMat(render_result.Outputs1.DepthMap));
+			//cv::imwrite((savedir / ("depth_" + std::to_string(disps.size() - 1) + ".png")).string(), TorchTensorToCVMat(render_result.Outputs1.DepthMap));
+			if (calculate_normals)
+			{
+				cv::imwrite((savedir / ("rendered_norm_" + std::to_string(disps.size() - 1) + ".png")).string(), TorchTensorToCVMat(render_result.Outputs1.RenderedNormals));
+			}
+			if (use_pred_normal)
+			{
+				cv::imwrite((savedir / ("pred_rendered_norm_" + std::to_string(disps.size() - 1) + ".png")).string(), TorchTensorToCVMat(render_result.Outputs1.RenderedPredNormals));
+			}
 		}
 	}
 	return std::make_pair(rgbs, disps);
@@ -371,10 +408,10 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(NeRFExecutorTrainParam
 		if (!std::filesystem::exists(test_save_dir))	std::filesystem::create_directories(test_save_dir);
 		std::cout << "test_poses_shape: " << data.RenderPoses.size() << std::endl;
 
-		//test args: perturb = False, raw_noise_std = 0.
-		auto [rgbs, disps] = RenderPath(data.RenderPoses, data.H, data.W, data.Focal, k, params.NSamples, params.Chunk, params.NetChunk,
+		//test args: perturb = False, raw_noise_std = 0., calculate_normals = false
+		auto [rgbs, disps] = RenderPath(data.RenderPoses, data.H, data.W, data.Focal, k, params.NSamples, params.Chunk,
 			params.ReturnRaw, params.LinDisp, 0, NImportance, params.WhiteBkgr, 0., { torch::Tensor(), torch::Tensor() },
-			params.Ndc, data.Near, data.Far, UseViewDirs, /*c2w_staticcam*/torch::Tensor(), /*data.Imgs,*/ test_save_dir, params.RenderFactor
+			params.Ndc, data.Near, data.Far, UseViewDirs, false/*calculate_normals*/, Params.use_pred_normal, /*c2w_staticcam*/torch::Tensor(), /*data.Imgs,*/ test_save_dir, params.RenderFactor
 		);
 
 		cv::VideoWriter video((test_save_dir / "video.avi").string(), cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), 30, cv::Size(data.W, data.H), true);
@@ -500,7 +537,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(NeRFExecutorTrainParam
 
 		RenderResult rgb_disp_acc_extras = Render(
 			data.H, data.W, k, Model, ExecutorEmbedder, ExecutorEmbeddirs, ModelFine,
-			params.NSamples, params.Chunk, params.NetChunk, params.ReturnRaw, params.LinDisp,
+			params.NSamples, params.Chunk, params.ReturnRaw, params.LinDisp,
 			0,		//0. or 1. If non - zero, each ray is sampled at stratified random points in time.
 			NImportance,
 			params.WhiteBkgr,
@@ -508,7 +545,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(NeRFExecutorTrainParam
 			batch_rays,  //либо rays либо pose c2w
 			torch::Tensor(),
 			params.Ndc,
-			data.Near, data.Far, UseViewDirs,
+			data.Near, data.Far, UseViewDirs, Params.calculate_normals || Params.use_pred_normal, Params.use_pred_normal,
 			torch::Tensor()
 		);
 
@@ -547,6 +584,27 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(NeRFExecutorTrainParam
 				}
 			}
 
+		if (rgb_disp_acc_extras.Outputs1.Normals.defined() && rgb_disp_acc_extras.Outputs1.Normals.numel() != 0)
+		{
+			const float orientation_loss_weight = 1.;//1e-4;
+			//Loss that encourages that all visible normals are facing towards the camera.
+			auto orientation_loss = OrientationLoss(rgb_disp_acc_extras.Outputs1.Weights.unsqueeze(-1).detach(), rgb_disp_acc_extras.Outputs1.Normals, batch_rays.second/*directions*/);
+			loss += orientation_loss_weight * torch::mean(orientation_loss);
+		}
+
+		//
+		if (Params.use_pred_normal)
+		{
+			const float pred_normal_loss_weight = 1.;//1e-3;
+			//Loss between normals calculated from density and normals from prediction network.
+			auto pred_normal_loss = PredNormalLoss(
+				rgb_disp_acc_extras.Outputs1.Weights.unsqueeze(-1).detach(),
+				rgb_disp_acc_extras.Outputs1.Normals.detach(),	//Градиент не течет сюда потому что хотим оптимизировать предсказанные нормали за счет вычисленных
+				rgb_disp_acc_extras.Outputs1.PredNormals
+			);
+			loss += pred_normal_loss_weight * torch::mean(pred_normal_loss);
+		}
+
 		loss.backward();
 		Optimizer->step();
 
@@ -578,9 +636,9 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(NeRFExecutorTrainParam
 			torch::NoGradGuard no_grad;
 
 			//test args: perturb = False, raw_noise_std = 0.
-			auto [rgbs, disps] = RenderPath(data.RenderPoses, data.H, data.W, data.Focal, k, params.NSamples, params.Chunk, params.NetChunk,
+			auto [rgbs, disps] = RenderPath(data.RenderPoses, data.H, data.W, data.Focal, k, params.NSamples, params.Chunk,
 				params.ReturnRaw, params.LinDisp, 0, NImportance, params.WhiteBkgr, 0., { torch::Tensor(), torch::Tensor() },
-				params.Ndc, data.Near, data.Far, UseViewDirs, /*c2w_staticcam*/torch::Tensor()/*, data.Imgs,*/ /*params.TestSaveDir, params.RenderFactor*/
+				params.Ndc, data.Near, data.Far, UseViewDirs, false/*calculate_normals*/, Params.use_pred_normal, /*c2w_staticcam*/torch::Tensor()/*, data.Imgs,*/ /*params.TestSaveDir, params.RenderFactor*/
 			);
 			std::cout << "Done, saving " << rgbs.size() << " " << rgbs[0].sizes() << " " << disps.size() << " " << disps[0].sizes() << std::endl;
 			auto path = params.BaseDir; /* / ("spiral_" + std::to_string(i)) */;
@@ -619,9 +677,9 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(NeRFExecutorTrainParam
 				//test_imgs.push_back(data.Imgs[k]);
 				test_poses.push_back(data.Poses[k].to(Device));
 			}
-			auto [rgbs, disps] = RenderPath(test_poses/*poses[i_test]).to(device)*/, data.H, data.W, data.Focal, k, params.NSamples, params.Chunk, params.NetChunk,
+			auto [rgbs, disps] = RenderPath(test_poses/*poses[i_test]).to(device)*/, data.H, data.W, data.Focal, k, params.NSamples, params.Chunk,
 				params.ReturnRaw, params.LinDisp, 0, NImportance, params.WhiteBkgr, 0., { torch::Tensor(), torch::Tensor() },
-				params.Ndc, data.Near, data.Far, UseViewDirs, /*c2w_staticcam*/torch::Tensor(), /*test_imgs,*/ test_save_dir, params.RenderFactor
+				params.Ndc, data.Near, data.Far, UseViewDirs, false/*calculate_normals*/, Params.use_pred_normal, /*c2w_staticcam*/torch::Tensor(), /*test_imgs,*/ test_save_dir, params.RenderFactor
 			);
 			std::cout << "Saved test set" << std::endl;
 		}

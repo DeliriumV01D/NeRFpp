@@ -38,25 +38,6 @@ std::pair<torch::Tensor, torch::Tensor> EmbedderImpl :: forward(torch::Tensor x)
 	return std::make_pair(outputs, torch::Tensor());
 }
 
-///x.sizes()[0] должно быть кратно размеру net_chunk
-torch::Tensor BaseNeRFImpl::Batchify(torch::Tensor x, const int net_chunk)
-{
-	torch::Tensor result;
-
-	if (net_chunk <= 0 || net_chunk >= x.sizes()[0])
-		return forward(x);
-
-	for (int i = 0; i < x.sizes()[0]; i += net_chunk)
-	{
-		if (i == 0)
-			result = forward(x.index({ torch::indexing::Slice(i, i + net_chunk) }));
-		else
-			result = torch::cat({ result, forward(x.index({ torch::indexing::Slice(i, i + net_chunk) })) }, 0);
-	}
-
-	return result;
-}
-
 NeRFImpl :: NeRFImpl(
 	const int d /*= 8*/,
 	const int w /*= 256*/,
@@ -343,10 +324,15 @@ NeRFSmallImpl :: NeRFSmallImpl(
 	const int geo_feat_dim /*= 15*/,
 	const int num_layers_color /*= 4*/,
 	const int hidden_dim_color /*= 64*/,
+	const bool use_pred_normal /*= true*/,
+	const int num_layers_normals /*= 3*/,
+	const int hidden_dim_normals /*= 64*/,
 	const int input_ch /*= 3*/,
 	const int input_ch_views /*= 3*/,
 	const std::string module_name /*= "hashnerf"*/
-) : BaseNeRFImpl(module_name), InputCh(input_ch), InputChViews(input_ch_views), NumLayers(num_layers), HiddenDim(hidden_dim), GeoFeatDim(geo_feat_dim), NumLayersColor(num_layers_color), HiddenDimColor(hidden_dim_color)
+) : BaseNeRFImpl(module_name), InputCh(input_ch), InputChViews(input_ch_views), NumLayers(num_layers), 
+	HiddenDim(hidden_dim), GeoFeatDim(geo_feat_dim), NumLayersColor(num_layers_color), HiddenDimColor(hidden_dim_color),
+	UsePredNormal(use_pred_normal), NumLayersNormals(num_layers_normals), HiddenDimNormals(hidden_dim_normals)
 {
 	for (int l = 0; l < NumLayers; l++)
 		SigmaNet->push_back(torch::nn::Linear(torch::nn::LinearOptions((l == 0) ? InputCh : HiddenDim, (l == NumLayers - 1) ? (1 + GeoFeatDim) : HiddenDim/*, false*/).bias(false)));	// 1 sigma + 15 SH features for color
@@ -354,17 +340,28 @@ NeRFSmallImpl :: NeRFSmallImpl(
 	for (int l = 0; l < NumLayersColor; l++)
 		ColorNet->push_back(torch::nn::Linear(torch::nn::LinearOptions((l == 0) ? InputChViews + GeoFeatDim + InputCh : HiddenDimColor, (l == NumLayersColor - 1) ? 3 : HiddenDimColor/*, false*/).bias(false)));
 
+	if (UsePredNormal)
+	{
+		for (int l = 0; l < NumLayersNormals; l++)
+			NormalsNet->push_back(torch::nn::Linear(torch::nn::LinearOptions((l == 0) ? 1 + GeoFeatDim + InputCh : HiddenDimNormals, (l == NumLayersNormals - 1) ? 3 : HiddenDimNormals/*, false*/).bias(false)));
+	}
+
 	for (int i = 0; i < SigmaNet->size(); i++)
 		register_module(module_name + "_sigma_net_" + std::to_string(i), SigmaNet[i]);
 
 	for (int i = 0; i < ColorNet->size(); i++)
 		register_module(module_name + "_color_net_" + std::to_string(i), ColorNet[i]);
 
+	if (UsePredNormal)
+	{
+		for (int i = 0; i < NormalsNet->size(); i++)
+			register_module(module_name + "_normals_net_" + std::to_string(i), NormalsNet[i]);
+	}
 }
 
 torch::Tensor NeRFSmallImpl :: forward(torch::Tensor x)
 {
-	std::vector<torch::Tensor> splits = torch::split(x, { InputCh, InputChViews }, -1);
+	std::vector<torch::Tensor> splits = torch::split(x, { InputCh, InputChViews}, -1);
 	auto input_pts = splits[0];
 	auto input_views = splits[1];
 	torch::Tensor sigma,
@@ -390,6 +387,25 @@ torch::Tensor NeRFSmallImpl :: forward(torch::Tensor x)
 			h = torch::relu(h);		//!!!inplace = true
 	}
 	auto color = h;
-	auto outputs = torch::cat({ color, sigma.unsqueeze(-1) }, -1);
+
+	//predicted normals
+	torch::Tensor predicted_normals;
+	if (UsePredNormal)
+	{
+		h = torch::cat({ sigma.unsqueeze(-1), geo_feat, input_pts }, -1);
+		for (int i = 0; i < NormalsNet->size(); i++)
+		{
+			h = NormalsNet[i]->as<torch::nn::Linear>()->forward(h);
+			if (i != NormalsNet->size() - 1)
+				h = torch::relu(h);		//!!!inplace = true
+			//else
+			//	h = torch::tanh(h);
+		}
+		predicted_normals = torch::nn::functional::normalize(h, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8));
+	}
+
+	auto outputs = torch::cat({ color, sigma.unsqueeze(-1), predicted_normals/*, calculated_normals*/ }, -1);
+	//calculated_normals будет добавлено позже в RunNetwork потому что там есть доступ к исходным точкам а не их эмбедингам
+
 	return outputs;
 }
