@@ -3,61 +3,10 @@
 #include "TorchHeader.h"
 #include "Trainable.h"
 #include "RayUtils.h"
+#include "BaseEmbedder.h"
 
 #include <set>
 
-///Hierarchical sampling
-inline torch::Tensor SamplePDF(torch::Tensor bins, torch::Tensor weights, const int nsamples, const bool det /*= false*/)
-{
-	torch::Device device = weights.device();
-	//Get probability density function (PDF)
-	weights = weights + 1e-5;
-	auto pdf = weights / torch::sum(weights, -1, true);
-	auto cdf = torch::cumsum(pdf, -1);
-	cdf = torch::cat({ torch::zeros_like(cdf.index({ "...", torch::indexing::Slice(torch::indexing::None, 1)})), cdf }, -1);		//[batch, len(bins)]
-	torch::Tensor u;
-	//Take uniform samples
-	std::vector<int64_t> sz(cdf.sizes().begin(), cdf.sizes().end());
-	sz.back() = nsamples;
-	if (det)
-	{
-		u = torch::linspace(0.f, 1.f, nsamples, torch::kFloat);
-		u = u.expand(sz);
-	}
-	else {
-		u = torch::rand(sz);
-	}
-
-	//Invert cumulative distribution function (CDF)
-	u = u.contiguous().to(device);
-	auto inds = torch::searchsorted(cdf, u, false, true);
-	auto below = torch::max(torch::zeros_like(inds - 1), inds - 1);
-	auto above = torch::min((cdf.sizes().back() - 1) * torch::ones_like(inds), inds);
-	auto inds_g = torch::stack({ below, above }, -1);  //[batch, N_samples, 2];
-
-	std::vector< int64_t> matched_shape{ inds_g.sizes()[0], inds_g.sizes()[1], cdf.sizes().back() };
-	auto cdf_g = torch::gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g);
-	auto bins_g = torch::gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g);
-
-	auto denom = (cdf_g.index({ "...", 1 }) - cdf_g.index({ "...", 0 }));
-	denom = torch::where(denom < 1e-5, torch::ones_like(denom), denom);
-	auto t = (u - cdf_g.index({ "...", 0 })) / denom;
-	auto samples = bins_g.index({ "...", 0 }) + t * (bins_g.index({ "...", 1 }) - bins_g.index({ "...", 0 }));
-
-	return samples;
-}
-
-///
-class BaseEmbedderImpl : public torch::nn::Module {
-protected:
-public:
-	BaseEmbedderImpl(const std::string &module_name) : torch::nn::Module(module_name) {}
-	virtual ~BaseEmbedderImpl() {}
-	virtual int GetOutputDims() { return 0; }//abstract;
-	///embedding + mask(can be empty)
-	virtual std::pair<torch::Tensor, torch::Tensor> forward(torch::Tensor x) { return std::make_pair(torch::Tensor(), torch::Tensor()); }//abstract;
-};
-TORCH_MODULE(BaseEmbedder);
 
 ///Positional encoding
 class EmbedderImpl : public BaseEmbedderImpl {
@@ -66,7 +15,7 @@ protected:
 	float MaxFreq;
 	bool IncludeInput;
 	int InputDims,
-		OutputDims = 0;;
+		OutputDims = 0;
 	bool LogSampling;
 	std::vector<float> FreqBands;
 public:
@@ -183,6 +132,7 @@ public:
 };
 TORCH_MODULE(SHEncoder);
 
+
 ///Hash encoding
 class HashEmbedderImpl : public BaseEmbedderImpl {
 protected:
@@ -228,6 +178,7 @@ public:
 	int GetLog2HashmapSize() const { return Log2HashmapSize; }
 	int GetBaseResolution() const { return BaseResolution; }
 	int GetFinestResolution() const { return FinestResolution; }
+	torch::Tensor GetBoundingBox() const { return BoundingBox; }
 
 
 	HashEmbedderImpl(
@@ -259,8 +210,8 @@ TORCH_MODULE(HashEmbedder);
 
 
 ///Small NeRF for Hash embeddings
-struct NeRFSmallImpl : public BaseNeRFImpl
-{
+class NeRFSmallImpl : public BaseNeRFImpl {
+protected:
 	int InputCh,
 		InputChViews,
 		NumLayers,
@@ -276,7 +227,7 @@ struct NeRFSmallImpl : public BaseNeRFImpl
 	torch::nn::ModuleList SigmaNet,
 		ColorNet,
 		NormalsNet;
-
+public:
 	NeRFSmallImpl(
 		const int num_layers = 3,
 		const int hidden_dim = 64,
@@ -308,7 +259,7 @@ inline torch::Tensor TotalVariationLoss(
 	const int max_resolution,
 	const int level,
 	const int log2_hashmap_size,
-	const int n_levels = 16
+	const int n_levels
 ){
 	//Get resolution
 	double b = exp((log(max_resolution) - log(min_resolution)) / (n_levels - 1));
@@ -316,7 +267,7 @@ inline torch::Tensor TotalVariationLoss(
 
 	//Cube size to apply TV loss
 	int	min_cube_size = min_resolution - 1;
-	int	max_cube_size = 50; //can be tuned
+	int	max_cube_size = max_resolution - 1; //can be tuned
 	if (min_cube_size > max_cube_size)
 		throw std::runtime_error("TotalVariationLoss: Error: min cuboid size greater than max!");
 	torch::Tensor cube_size = torch::floor(torch::clip(resolution / 10.f, min_cube_size, max_cube_size)).to(torch::kLong);// .to(device);

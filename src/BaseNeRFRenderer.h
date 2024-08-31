@@ -1,6 +1,8 @@
 #pragma once
 
 #include "NeRF.h"
+#include "Sampler.h"
+#include "LeRF.h"
 
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/imgproc/types_c.h>
@@ -16,7 +18,9 @@ struct Outputs {
 		Normals,		///Calculated normals  [num_rays, num_samples, 3]
 		PredNormals,///Predicted normals  [num_rays, num_samples, 3]
 		RenderedNormals,		///Rendered calculated normals [num_rays, 3]
-		RenderedPredNormals;///Rendered predicted normals [num_rays, 3]
+		RenderedPredNormals,///Rendered predicted normals [num_rays, 3]
+		LangEmbedding,	///[num_rays, num_samples, lang_embed_dim]
+		RenderedLangEmbedding;	///[num_rays, lang_embed_dim]
 };
 
 struct RenderResult
@@ -70,12 +74,14 @@ inline torch::Tensor RunNetwork(
 		auto [embedded_dirs, _] = embeddirs_fn(input_dirs_flat);
 		embedded = torch::cat({ embedded, embedded_dirs }, -1);
 	}
-
 	torch::Tensor outputs_flat = fn->forward(embedded);
 
-	//set sigma to 0 for invalid points
-	if (keep_mask.defined() && keep_mask.numel() != 0)
-		outputs_flat = outputs_flat.index_put_({ ~keep_mask, -1 }, 0);
+	if constexpr (!std::is_same_v<TNeRF, LeRF>)
+	{
+		//set sigma to 0 for invalid points
+		if (keep_mask.defined() && keep_mask.numel() != 0)
+			/*outputs_flat =*/ outputs_flat.index_put_({ ~keep_mask, -1 }, 0);
+	}
 
 	//Calculated normals, 	//inputs_flat.set_requires_grad(true);
 	if (calculate_normals)
@@ -90,7 +96,7 @@ inline torch::Tensor RunNetwork(
 			true
 		)[0];
 		//Берем направление обратное градиенту
-		calculated_normals = - torch::nn::functional::normalize(calculated_normals, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8));
+		calculated_normals = - /*torch::nn::functional::normalize(*/calculated_normals/*, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8))*/;
 		outputs_flat = torch::cat({ outputs_flat, calculated_normals }, -1);
 	}
 
@@ -101,6 +107,35 @@ inline torch::Tensor RunNetwork(
 	return outputs;
 }
 
+
+static torch::Tensor NormalMapFromDepthMap(const torch::Tensor depth)
+{
+	int h, w;
+	h = depth.sizes()[0];
+	w = depth.sizes()[1];
+	torch::Tensor normals = torch::zeros({h, w, 3});
+	try {
+	for (int i = 1; i < h - 1; i++)
+		for (int j = 1; j < w - 1; j++)
+		{
+			//std::cout<<depth[i + 1][j]<<" "<<depth[i - 1][j]<<" "<<depth[i][j + 1]<<" "<<depth[i][j - 1]<<std::endl;
+			auto dzdx = (depth[i + 1][j] - depth[i - 1][j]) / 2.0;
+			auto dzdy = (depth[i][j + 1] - depth[i][j - 1]) / 2.0;
+			auto n = torch::cat({-dzdx.unsqueeze(0), -dzdy.unsqueeze(0), torch::tensor({ 0.5f }, torch::kFloat32).to(depth.device())}, -1);
+			//auto n = torch::tensor({ -dzdx, -dzdy, 1.0f }, torch::kFloat32);
+			//std::cout<<"n: "<<n<<std::endl;
+			n = torch::nn::functional::normalize(n, torch::nn::functional::NormalizeFuncOptions().dim(-1));
+			//std::cout<<"normals.index({ ""..."", -1}): "<<normals.index({ "...", -1}).sizes()<<std::endl;
+			//std::cout<<"normals.index({ ""..."", torch::indexing::Slice()}): "<<normals.index({ "...", torch::indexing::Slice()}).sizes()<<std::endl;
+			/*normals = */ normals.index_put_({ i, j, torch::indexing::Slice()}, n * 0.5f + 0.5f);
+		}
+	} catch (std::exception &e) {
+		std::cout<<e.what()<<std::endl;
+	}
+	return normals;
+}
+
+///поэлементно mm == *, матрично matmul == @
 /////Calculate normals along the ray.
 //inline torch::Tensor RenderNormals(		///[bs, 3]
 //	const torch::Tensor normals, ///[bs, num_samples, 3]
@@ -119,6 +154,7 @@ inline torch::Tensor RunNetwork(
 //	return torch::ones_like(n) * cos_n_rd.unsqueeze(-1);
 //}
 
+///!!!///поэлементно mm == *, матрично matmul == @
 /////Calculate normals along the ray.
 //inline torch::Tensor RenderNormals(		///[bs, 3]
 //	const torch::Tensor normals, ///[bs, num_samples, 3]
@@ -140,13 +176,13 @@ inline torch::Tensor RenderNormals(		///[bs, 3]
 	auto bg = torch::zeros_like(normals);
 	auto alpha = torch::cat({weights, weights, weights}, -1);
 
-	auto n = (alpha * (normals + 1) / 2 + (1. - alpha) * bg).sum(-2, false);
+	auto n = (alpha * (normals + 1) / 2 /*+ (1. - alpha) * bg*/).sum(-2, false);
 
 	//if (normalize)
 	//	n = torch::nn::functional::normalize(n, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8));
 
 	//if (keep_alpha)
-	//	normals = torch::cat({weights, normals}, -1);
+	//	n = torch::cat({weights, n}, -1);
 	return n;
 }
 
@@ -154,6 +190,34 @@ inline torch::Tensor RenderNormals(		///[bs, 3]
 inline torch::Tensor NormalsShader(const torch::Tensor normals) ///[bs, num_samples, 3]
 {
 	return normals;//(normals + 1) / 2;
+}
+
+
+////test
+//int embed_dim = 4,
+//	bs = 2,
+//	num_samples = 3;
+//torch::Tensor embeds = torch::rand({ bs, num_samples, embed_dim }),
+//	weights = torch::rand({ bs, num_samples, 1 });
+//std::cout << "embeds: " << embeds << std::endl;
+//std::cout << "weights: " << weights << std::endl;
+//auto output = weights * embeds;
+//std::cout << "mm: " << output << std::endl;
+//output = torch::sum(output, -2);
+//std::cout << "sum: " << output << std::endl;
+//output = torch::nn::functional::normalize(output, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8));
+//std::cout << "normalize: " << output << std::endl;
+//return 0 ;
+///Calculate CLIP embeddings along ray.
+inline torch::Tensor RenderCLIPEmbedding(		///[bs, embed_dim]
+	const torch::Tensor embeds,		///[bs, num_samples, embed_dim]
+	const torch::Tensor weights,	///[bs, num_samples, 1]
+	const bool normalize = true
+) {
+	auto output = torch::sum(weights * embeds, -2);
+	//output = output / torch::linalg::norm(output, -1, keepdim=true);
+	output = torch::nn::functional::normalize(output, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8));
+	return output;
 }
 
 ///Transforms model's predictions to semantically meaningful values.
@@ -164,7 +228,9 @@ inline Outputs RawToOutputs(
 	const float raw_noise_std = 0.f,
 	const bool white_bkgr = false,
 	const bool calculate_normals = false,
-	const bool use_pred_normal = false
+	const bool use_pred_normal = false,
+	const bool use_lerf = false,
+	const int lang_embed_dim = 768
 ) {
 	torch::Device device = raw.device();
 	Outputs result;
@@ -197,32 +263,49 @@ inline Outputs RawToOutputs(
 	if (white_bkgr)
 		result.RGBMap = result.RGBMap + (1. - result.AccMap.index({ "...", torch::indexing::None }));
 
+	int cur_pos = 4;
 	//Вычисленные нормали коннектятся в конце. Если есть предсказанные нормали то есть и вычисленные но не наоборот
-	
-	//Calculated normals
-	if (calculate_normals)
-	{
-		if (use_pred_normal)
-		{
-			result.Normals = torch::tanh(raw.index({ "...",  torch::indexing::Slice(6, 9) }));		//извлекает значения из 7-9 столбцов raw
-		} else {
-			result.Normals = torch::tanh(raw.index({ "...",  torch::indexing::Slice(3, 6) }));		//извлекает значения из 4-6 столбцов raw //Уже отнормировано в месте вычисления
-		}
-		result.RenderedNormals = RenderNormals(result.Normals, result.Weights.unsqueeze(-1));
-		result.RenderedNormals = NormalsShader(result.RenderedNormals);
-	}
 
 	//Predicted normals
 	if (use_pred_normal)
 	{
-		result.PredNormals = torch::tanh(raw.index({ "...",  torch::indexing::Slice(3, 6) }));		//извлекает значения из 4-6 столбцов raw
+		result.PredNormals = /*torch::tanh(*/raw.index({ "...",  torch::indexing::Slice(cur_pos, cur_pos + 3/*3, 6*/) })/*)*/;		//извлекает значения из 4-6 столбцов raw
 		//result.PredNormals = torch::nn::functional::normalize(result.PredNormals, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8)); //Уже отнормировано в месте вычисления
-		result.RenderedPredNormals = RenderNormals(result.PredNormals, result.Weights.unsqueeze(-1));
+		result.RenderedPredNormals = RenderNormals(result.PredNormals, result.Weights.unsqueeze(-1).detach());
 		result.RenderedPredNormals = NormalsShader(result.RenderedPredNormals);
+		cur_pos += 3;
+	}
+
+	if (use_lerf)
+	{
+		auto le_density_before_activation = raw.index({ "...", cur_pos});		//    извлекает значения (sigma_le) очередного столбца raw
+		torch::Tensor le_alpha = raw2alpha(le_density_before_activation, dists);  //[N_rays, N_samples]
+		torch::Tensor le_weights = le_alpha * torch::cumprod(
+				torch::cat({ torch::ones({le_alpha.sizes()[0], 1}).to(device), -le_alpha + 1.f + 1e-10f }, -1),
+				-1
+			).index({ torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, -1) });
+		cur_pos += 1;
+		result.LangEmbedding = /*torch::tanh(*/raw.index({ "...",  torch::indexing::Slice(cur_pos, cur_pos + lang_embed_dim) })/*)*/;
+		result.RenderedLangEmbedding = RenderCLIPEmbedding(result.LangEmbedding, le_weights.unsqueeze(-1));
+		//result.RenderedLangEmbedding = RenderCLIPEmbedding(result.LangEmbedding, result.Weights.unsqueeze(-1).detach());
+		//result.RenderedLanguageEmbedding = CLIPEmbeddingShader(result.RenderedLanguageEmbedding);
+		cur_pos += lang_embed_dim;
+	}
+	
+	//Calculated normals
+	if (calculate_normals)
+	{
+		result.Normals = /*torch::tanh(*/raw.index({ "...",  torch::indexing::Slice(cur_pos, cur_pos + 3) })/*)*/;
+		//if (use_pred_normal) Slice(6, 9) //извлекает значения из 7-9 столбцов raw else Slice(3, 6) //извлекает значения из 4-6 столбцов raw 
+	 //Уже отнормировано в месте вычисления
+		result.RenderedNormals = RenderNormals(result.Normals, result.Weights.unsqueeze(-1).detach());
+		result.RenderedNormals = NormalsShader(result.RenderedNormals);
+		cur_pos += 3;
 	}
 
 	return result;
 }
+
 
 ///Volumetric rendering.
 template <class TEmbedder, class TEmbedDirs, class TNeRF>
@@ -240,7 +323,10 @@ inline RenderResult RenderRays(
 	const bool white_bkgr = false,					///If True, assume a white background.
 	const float raw_noise_std = 0.,
 	const bool calculate_normals = false,
-	const bool use_pred_normal = false
+	const bool use_pred_normal = false,
+	const bool use_lerf = false,
+	const int lang_embed_dim = 768,
+	const bool return_weights = true
 ) {
 	torch::Device device = ray_batch.device();		//Передать параметром??
 	RenderResult result;
@@ -257,7 +343,6 @@ inline RenderResult RenderRays(
 
 	torch::Tensor t_vals = torch::linspace(0.f, 1.f, n_samples, torch::kFloat).to(device);
 	torch::Tensor z_vals;
-
 	if (!lin_disp)
 	{
 		z_vals = near * (1. - t_vals) + far * (t_vals);
@@ -279,7 +364,7 @@ inline RenderResult RenderRays(
 
 	auto pts = rays_o.index({ "...", torch::indexing::None, torch::indexing::Slice() }) + rays_d.index({ "...", torch::indexing::None, torch::indexing::Slice() }) * z_vals.index({ "...", torch::indexing::Slice(), torch::indexing::None}); //[N_rays, N_samples, 3]
 	torch::Tensor raw = RunNetwork(pts, viewdirs, /*torch::Tensor(),*/ nerf, embed_fn, embeddirs_fn, (n_importance <= 0) && calculate_normals);
-	result.Outputs1 = RawToOutputs(raw, z_vals, rays_d, raw_noise_std, white_bkgr, (n_importance <= 0) && calculate_normals, (n_importance <= 0) && use_pred_normal);
+	result.Outputs1 = RawToOutputs(raw, z_vals, rays_d, raw_noise_std, white_bkgr, (n_importance <= 0) && calculate_normals, (n_importance <= 0) && use_pred_normal, (n_importance <= 0) && use_lerf, lang_embed_dim);
 
 	if (n_importance > 0)
 	{
@@ -297,13 +382,24 @@ inline RenderResult RenderRays(
 		}	else {
 			raw = RunNetwork(pts, viewdirs, network_fine, embed_fn, embeddirs_fn, calculate_normals);
 		}
-		result.Outputs1 = RawToOutputs(raw, z_vals, rays_d, raw_noise_std, white_bkgr, calculate_normals, use_pred_normal);
+		result.Outputs1 = RawToOutputs(raw, z_vals, rays_d, raw_noise_std, white_bkgr, calculate_normals, use_pred_normal, use_lerf, lang_embed_dim);
 		result.ZStd = torch::std(z_samples, -1, false);  // [N_rays]
 	}
 
 	if (return_raw)
 		result.Raw = raw;
 
+	if (!return_weights)
+	{
+		result.Outputs0.Weights = torch::Tensor();
+		result.Outputs1.Weights = torch::Tensor();
+		result.Outputs0.PredNormals = torch::Tensor();
+		result.Outputs1.PredNormals = torch::Tensor();
+		result.Outputs0.Normals = torch::Tensor();
+		result.Outputs1.Normals = torch::Tensor();
+		result.Outputs0.LangEmbedding = torch::Tensor();
+		result.Outputs1.LangEmbedding = torch::Tensor();
+	}
 	return result;
 }
 
@@ -326,14 +422,18 @@ inline RenderResult BatchifyRays(
 	const bool white_bkgr = false,					///If True, assume a white background.
 	const float raw_noise_std = 0.,
 	const bool calculate_normals = false,
-	const bool use_pred_normal = false
+	const bool use_pred_normal = false,
+	const bool use_lerf = false,
+	const int lang_embed_dim = 768,
+	const bool return_weights = true
 ) {
 	RenderResult result;
 	std::vector<RenderResult> all_results;
 	all_results.reserve(rays_flat.sizes()[0] / chunk);
 	for (int i = 0; i < rays_flat.sizes()[0]; i += chunk)
-		all_results.push_back(RenderRays(
-			rays_flat.index({ torch::indexing::Slice(i, i + chunk) }),
+	{
+		all_results.emplace_back(RenderRays(
+			rays_flat.index({ torch::indexing::Slice(i, ((i + chunk) <= rays_flat.sizes()[0])?(i+chunk):(rays_flat.sizes()[0])) }),
 			nerf,
 			embed_fn,
 			embeddirs_fn,
@@ -346,8 +446,12 @@ inline RenderResult BatchifyRays(
 			white_bkgr,
 			raw_noise_std,
 			calculate_normals,
-			use_pred_normal
+			use_pred_normal,
+			use_lerf,
+			lang_embed_dim,
+			return_weights
 		));
+	}
 	//Слить all_results в один RenderResult используя torch::cat(torch::TensorList - at::ArrayRef ...
 	//!!!make this part cleaner and shorter
 	std::vector <torch::Tensor> out_rgb_map,
@@ -359,6 +463,8 @@ inline RenderResult BatchifyRays(
 		out_pred_normals,
 		out_rendered_normals,
 		out_rendered_pred_normals,
+		out_lang_embedding,
+		out_rendered_lang_embedding,
 		out0_rgb_map,
 		out0_disp_map,
 		out0_acc_map,
@@ -368,6 +474,8 @@ inline RenderResult BatchifyRays(
 		out0_pred_normals,
 		out0_rendered_normals,
 		out0_rendered_pred_normals,
+		out0_lang_embedding,
+		out0_rendered_lang_embedding,
 		raw,
 		z_std;
 	for (auto it : all_results)
@@ -381,6 +489,8 @@ inline RenderResult BatchifyRays(
 		if (it.Outputs1.PredNormals.defined()) out_pred_normals.push_back(it.Outputs1.PredNormals);
 		if (it.Outputs1.RenderedNormals.defined()) out_rendered_normals.push_back(it.Outputs1.RenderedNormals);
 		if (it.Outputs1.RenderedPredNormals.defined()) out_rendered_pred_normals.push_back(it.Outputs1.RenderedPredNormals);
+		if (it.Outputs1.LangEmbedding.defined()) out_lang_embedding.push_back(it.Outputs1.LangEmbedding);
+		if (it.Outputs1.RenderedLangEmbedding.defined()) out_rendered_lang_embedding.push_back(it.Outputs1.RenderedLangEmbedding);
 		if (it.Outputs0.RGBMap.defined()) out0_rgb_map.push_back(it.Outputs0.RGBMap);
 		if (it.Outputs0.DispMap.defined()) out0_disp_map.push_back(it.Outputs0.DispMap);
 		if (it.Outputs0.AccMap.defined()) out0_acc_map.push_back(it.Outputs0.AccMap);
@@ -390,6 +500,8 @@ inline RenderResult BatchifyRays(
 		if (it.Outputs0.PredNormals.defined()) out0_pred_normals.push_back(it.Outputs0.PredNormals);
 		if (it.Outputs0.RenderedNormals.defined()) out0_rendered_normals.push_back(it.Outputs0.RenderedNormals);
 		if (it.Outputs0.RenderedPredNormals.defined()) out0_rendered_pred_normals.push_back(it.Outputs0.RenderedPredNormals);
+		if (it.Outputs0.LangEmbedding.defined()) out0_lang_embedding.push_back(it.Outputs0.LangEmbedding);
+		if (it.Outputs0.RenderedLangEmbedding.defined()) out0_rendered_lang_embedding.push_back(it.Outputs0.RenderedLangEmbedding);
 		if (it.Raw.defined()) raw.push_back(it.Raw);
 		if (it.ZStd.defined()) z_std.push_back(it.ZStd);
 	}
@@ -402,6 +514,8 @@ inline RenderResult BatchifyRays(
 	if (!out_pred_normals.empty()) result.Outputs1.PredNormals = torch::cat(out_pred_normals, 0);
 	if (!out_rendered_normals.empty()) result.Outputs1.RenderedNormals = torch::cat(out_rendered_normals, 0);
 	if (!out_rendered_pred_normals.empty()) result.Outputs1.RenderedPredNormals = torch::cat(out_rendered_pred_normals, 0);
+	if (!out_lang_embedding.empty()) result.Outputs1.LangEmbedding = torch::cat(out_lang_embedding, 0);
+	if (!out_rendered_lang_embedding.empty()) result.Outputs1.RenderedLangEmbedding = torch::cat(out_rendered_lang_embedding, 0);
 	if (!out0_rgb_map.empty()) result.Outputs0.RGBMap = torch::cat(out0_rgb_map, 0);
 	if (!out0_disp_map.empty()) result.Outputs0.DispMap = torch::cat(out0_disp_map, 0);
 	if (!out0_acc_map.empty()) result.Outputs0.AccMap = torch::cat(out0_acc_map, 0);
@@ -411,11 +525,37 @@ inline RenderResult BatchifyRays(
 	if (!out0_pred_normals.empty()) result.Outputs0.PredNormals = torch::cat(out0_pred_normals, 0);
 	if (!out0_rendered_normals.empty()) result.Outputs0.RenderedNormals = torch::cat(out0_rendered_normals, 0);
 	if (!out0_rendered_pred_normals.empty()) result.Outputs0.RenderedPredNormals = torch::cat(out0_rendered_pred_normals, 0);
+	if (!out0_lang_embedding.empty()) result.Outputs0.LangEmbedding = torch::cat(out0_lang_embedding, 0);
+	if (!out0_rendered_lang_embedding.empty()) result.Outputs0.RenderedLangEmbedding = torch::cat(out0_rendered_lang_embedding, 0);
 	if (!raw.empty()) result.Raw = torch::cat(raw, 0);
 	if (!z_std.empty()) result.ZStd = torch::cat(z_std, 0);
 
 	return result;
 }
+
+struct RenderParams {
+	int NSamples{64};								///Samples along ray
+	int NImportance{192};						///Number of additional times to sample along each ray.
+	int Chunk{1024 * 32};						///Maximum number of rays to process simultaneously.Used to control maximum memory usage.Does not affect final results.
+	bool ReturnRaw{false};					///If True, include model's raw, unprocessed predictions.
+	bool LinDisp{false};						///If True, sample linearly in inverse depth rather than in depth.
+	float Perturb{0.f};							///0. or 1. If non - zero, each ray is sampled at stratified random points in time.
+	bool WhiteBkgr{false};					///If True, assume a white background.
+	float RawNoiseStd{0.};
+	bool Ndc{true};							///If True, represent ray origin, direction in NDC coordinates.
+	float Near{0.};							///float or array of shape[batch_size].Nearest distance for a ray.
+	float Far{1.};							///float or array of shape[batch_size].Farthest distance for a ray.
+	bool UseViewdirs{false};		///If True, use viewing direction of a point in space in model.
+	bool CalculateNormals{false};
+	bool UsePredNormal{false};	///whether to use predicted normals
+	bool ReturnWeights{false};
+	bool UseLeRF{false};
+	int LangEmbedDim {768};
+	//torch::Tensor C2wStaticCam{torch::Tensor()};			///array of shape[3, 4].If not None, use this transformation matrix for camera while using other c2w argument for viewing directions.
+	float RenderFactor{0};
+	torch::Tensor LerfPositives/*= torch::Tensor()*/;
+	torch::Tensor LerfNegatives/*= torch::Tensor()*/;
+};
 
 ///Если определены позиции c2w то rays не нужен т.к.не используется (задавать либо pose c2w либо rays)
 template <class TEmbedder, class TEmbedDirs, class TNeRF>
@@ -427,22 +567,9 @@ inline RenderResult Render(
 	TEmbedder embed_fn,
 	TEmbedDirs embeddirs_fn,
 	TNeRF network_fine,											///"fine" network with same spec as network_fn.
-	const int n_samples,
-	const int chunk = 1024 * 32,						///Maximum number of rays to process simultaneously.Used to control maximum memory usage.Does not affect final results.
-	const bool return_raw = false,					///If True, include model's raw, unprocessed predictions.
-	const bool lin_disp = false,						///If True, sample linearly in inverse depth rather than in depth.
-	const float perturb = 0.f,							///0. or 1. If non - zero, each ray is sampled at stratified random points in time.
-	const int n_importance = 0,							///Number of additional times to sample along each ray.
-	const bool white_bkgr = false,					///If True, assume a white background.
-	const float raw_noise_std = 0.,
+	const RenderParams &render_params,
 	std::pair<torch::Tensor, torch::Tensor> rays = { torch::Tensor(), torch::Tensor() },			///array of shape[2, batch_size, 3].Ray origin and direction for each example in batch.
 	torch::Tensor c2w = torch::Tensor(),			///array of shape[3, 4].Camera - to - world transformation matrix.
-	const bool ndc = true,						///If True, represent ray origin, direction in NDC coordinates.
-	const float near = 0.,						///float or array of shape[batch_size].Nearest distance for a ray.
-	const float far = 1.,							///float or array of shape[batch_size].Farthest distance for a ray.
-	const bool use_viewdirs = false,	///If True, use viewing direction of a point in space in model.
-	const bool calculate_normals = false,
-	const bool use_pred_normal = false,	///whether to use predicted normals
 	torch::Tensor c2w_staticcam = torch::Tensor()			///array of shape[3, 4].If not None, use this transformation matrix for camera while using other c2w argument for viewing directions.
 ) {
 	torch::Tensor rays_o, rays_d;
@@ -450,14 +577,13 @@ inline RenderResult Render(
 	{
 		//special case to render full image
 		std::tie(rays_o, rays_d) = GetRays(h, w, k, c2w);
-	}
-	else {
+	}	else {
 		//use provided ray batch
 		std::tie(rays_o, rays_d) = rays;
 	}
 
 	torch::Tensor viewdirs;
-	if (use_viewdirs)
+	if (render_params.UseViewdirs)
 	{
 		//provide ray directions as input
 		viewdirs = rays_d;
@@ -471,7 +597,7 @@ inline RenderResult Render(
 	}
 
 	auto sh = rays_d.sizes();			//[..., 3]
-	if (ndc)
+	if (render_params.Ndc)
 	{
 		//for forward facing scenes
 		std::tie(rays_o, rays_d) = NDCRays(h, w, k[0][0].item<float>()/*focal*/, 1.f, rays_o, rays_d);
@@ -481,17 +607,20 @@ inline RenderResult Render(
 	rays_o = torch::reshape(rays_o, { -1, 3 });//.float()
 	rays_d = torch::reshape(rays_d, { -1, 3 });//.float()
 
-	auto near_ = near * torch::ones_like(rays_d.index({ "...", torch::indexing::Slice(torch::indexing::None, 1) }));
-	auto far_ = far * torch::ones_like(rays_d.index({ "...", torch::indexing::Slice(torch::indexing::None, 1) }));
+	auto near_ = render_params.Near * torch::ones_like(rays_d.index({ "...", torch::indexing::Slice(torch::indexing::None, 1) }));
+	auto far_ = render_params.Far * torch::ones_like(rays_d.index({ "...", torch::indexing::Slice(torch::indexing::None, 1) }));
 	auto rays_ = torch::cat({ rays_o, rays_d, near_, far_ }, -1);
 	
-	if (use_viewdirs)
+	if (render_params.UseViewdirs)
 		rays_ = torch::cat({ rays_, viewdirs }, -1);
 
 	//Renderand reshape
-	RenderResult all_ret = BatchifyRays(
-		rays_, nerf, embed_fn, embeddirs_fn, network_fine, n_samples, chunk, return_raw, lin_disp, perturb, n_importance, white_bkgr, raw_noise_std, calculate_normals, use_pred_normal
-	);
+	RenderResult all_ret = std::move(BatchifyRays(
+		rays_, nerf, embed_fn, embeddirs_fn, network_fine,
+		render_params.NSamples, render_params.Chunk, render_params.ReturnRaw, render_params.LinDisp, render_params.Perturb,
+		render_params.NImportance, render_params.WhiteBkgr, render_params.RawNoiseStd, render_params.CalculateNormals, render_params.UsePredNormal,
+		render_params.UseLeRF, render_params.LangEmbedDim, render_params.ReturnWeights
+	));
 
 	if (all_ret.Outputs1.RGBMap.numel() != 0)
 		all_ret.Outputs1.RGBMap = torch::reshape(all_ret.Outputs1.RGBMap, sh);		//[640000, 3] -> [800, 800, 3]
@@ -507,6 +636,16 @@ inline RenderResult Render(
 			all_ret.Outputs1.DepthMap = torch::reshape(all_ret.Outputs1.DepthMap, { sh[0], sh[1] });
 		if (all_ret.Outputs0.DepthMap.numel() != 0)
 			all_ret.Outputs0.DepthMap = torch::reshape(all_ret.Outputs0.DepthMap, { sh[0], sh[1] });
+
+		if (all_ret.Outputs1.RenderedLangEmbedding.numel() != 0)
+			all_ret.Outputs1.RenderedLangEmbedding = torch::reshape(all_ret.Outputs1.RenderedLangEmbedding, { sh[0], sh[1], render_params.LangEmbedDim });
+		if (all_ret.Outputs0.RenderedLangEmbedding.numel() != 0)
+			all_ret.Outputs0.RenderedLangEmbedding = torch::reshape(all_ret.Outputs0.RenderedLangEmbedding, { sh[0], sh[1], render_params.LangEmbedDim });
+	} else {
+		if (all_ret.Outputs1.RenderedLangEmbedding.numel() != 0)
+			all_ret.Outputs1.RenderedLangEmbedding = torch::reshape(all_ret.Outputs1.RenderedLangEmbedding, { sh[0], render_params.LangEmbedDim });
+		if (all_ret.Outputs0.RenderedLangEmbedding.numel() != 0)
+			all_ret.Outputs0.RenderedLangEmbedding = torch::reshape(all_ret.Outputs0.RenderedLangEmbedding, { sh[0], render_params.LangEmbedDim });
 	}
 
 
@@ -520,7 +659,7 @@ inline RenderResult Render(
 	//if (all_ret.Outputs0.PredNormals.numel() != 0)
 	//	all_ret.Outputs0.PredNormals = torch::reshape(all_ret.Outputs0.PredNormals, sh);
 
-	if (calculate_normals)
+	if (render_params.CalculateNormals)
 	{
 		if (all_ret.Outputs1.RenderedNormals.numel() != 0)
 			all_ret.Outputs1.RenderedNormals = torch::reshape(all_ret.Outputs1.RenderedNormals, sh);
@@ -528,7 +667,7 @@ inline RenderResult Render(
 			all_ret.Outputs0.RenderedNormals = torch::reshape(all_ret.Outputs0.RenderedNormals, sh);
 	}
 
-	if (use_pred_normal)
+	if (render_params.UsePredNormal)
 	{
 		if (all_ret.Outputs1.RenderedPredNormals.numel() != 0)
 			all_ret.Outputs1.RenderedPredNormals = torch::reshape(all_ret.Outputs1.RenderedPredNormals, sh);

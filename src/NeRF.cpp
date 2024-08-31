@@ -312,6 +312,7 @@ std::pair<torch::Tensor, torch::Tensor> HashEmbedderImpl :: forward(torch::Tenso
 		torch::Tensor x_embedded = TrilinearInterp(x, voxel_vertices.VoxelMinVertex, voxel_vertices.VoxelMaxVertex, voxel_embedds);
 		x_embedded_all.push_back(x_embedded);
 	}
+
 	auto keep_mask = voxel_vertices.KeepMask.sum(-1) == voxel_vertices.KeepMask.sizes().back();
 	return std::make_pair(torch::cat(x_embedded_all, -1), keep_mask);
 }
@@ -401,7 +402,7 @@ torch::Tensor NeRFSmallImpl :: forward(torch::Tensor x)
 			//else
 			//	h = torch::tanh(h);
 		}
-		predicted_normals = torch::nn::functional::normalize(h, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8));
+		predicted_normals = /*torch::nn::functional::normalize(*/h/*, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8))*/;
 	}
 
 	auto outputs = torch::cat({ color, sigma.unsqueeze(-1), predicted_normals/*, calculated_normals*/ }, -1);

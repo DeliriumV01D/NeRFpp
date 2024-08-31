@@ -5,17 +5,31 @@ cmake_minimum_required(VERSION 3.8)
 include_directories(${CMAKE_SOURCE_DIR}/src)
 include_directories(${CMAKE_SOURCE_DIR}/src/Common)
 include_directories(${CMAKE_SOURCE_DIR}/src/LibTorchTraining)
+include_directories(${CMAKE_SOURCE_DIR}/../RuCLIP/src)
+include_directories(${CMAKE_SOURCE_DIR}/../RuCLIP/src/youtokentome)
+include_directories(${CMAKE_SOURCE_DIR}/../RuCLIP/src/youtokentome/third_party)
 #include_directories("src/LibTorchTraining")
 
-#link_directories(
-#	"C:/Program Files (x86)/Intel/oneAPI/mkl/2022.1.0/lib/intel64"
-#)
+link_directories(
+	"C:/Program Files (x86)/Intel/oneAPI/mkl/2022.1.0/lib/intel64"
+)
 
 set(SOURCES ${SOURCES}
 	src/LibTorchTraining/Trainable.cpp
+	src/CuSHEncoder.cpp
+	src/CuSHEncoder.cu
+	src/CuHashEmbedder.cpp
+	src/CuHashEmbedder.cu
 	src/NeRF.cpp
 	src/BaseNeRFRenderer.cpp
 	src/NeRFExecutor.cpp
+	../RuCLIP/src/RuCLIP.cpp
+	../RuCLIP/src/RuCLIPProcessor.cpp
+	../RuCLIP/src/youtokentome/utf8.cpp
+	../RuCLIP/src/youtokentome/utils.cpp
+	../RuCLIP/src/youtokentome/bpe.cpp	
+	src/PyramidEmbedder.cpp
+	src/LeRF.cpp
 	src/main.cpp
 )
 
@@ -25,11 +39,21 @@ set(HEADERS ${HEADERS}
 	src/load_blender.h
 	src/LibTorchTraining/TorchHeader.h
 	src/LibTorchTraining/Trainable.h
+	src/BaseEmbedder.h
+	src/CuSHEncoder.h
+	src/CuHashEmbedder.h
 	src/NeRF.h
 	src/BaseNeRFRenderer.h
 	src/NeRFExecutor.h
 	src/Common/TRandomInt.h
 	src/RayUtils.h
+	../RuCLIP/src/RuCLIP.h
+	../RuCLIP/src/youtokentome/utf8.h
+	../RuCLIP/src/youtokentome/utils.h
+	../RuCLIP/src/youtokentome/bpe.h
+	../RuCLIP/src/RuCLIPProcessor.h
+	src/PyramidEmbedder.h
+	src/LeRF.h
 )
 
 set(LIBS ${LIBS}

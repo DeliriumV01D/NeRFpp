@@ -3,7 +3,7 @@
 #include "json.hpp"
 #include "TorchHeader.h"
 #include "BaseNeRFRenderer.h"
-#include "RayUtils.h"
+//#include "RayUtils.h"
 
 #include <filesystem>
 #include <string>
@@ -46,53 +46,66 @@ inline torch::Tensor rot_theta(const float th)
 	return result;
 }
 
-inline torch::Tensor pose_spherical(const float theta, const float phi, const float radius)
+inline torch::Tensor pose_spherical(const float theta, const float phi, const float radius, const float x = 0, const float y = 0, const float z = 0)
 {
 	auto c2w = trans_t(radius);
-	c2w = torch::mm(rot_phi(phi / 180. * PI), c2w);
-	c2w = torch::mm(rot_theta(theta / 180. * PI), c2w);
+	c2w = torch::matmul(rot_phi(phi / 180. * PI), c2w);
+	c2w = torch::matmul(rot_theta(theta / 180. * PI), c2w);
 	float data[] = { -1, 0, 0, 0,
 		0, 0, 1, 0,
 		0, 1, 0, 0,
 		0, 0, 0, 1 };
-	c2w = torch::mm(torch::from_blob(data, { 4, 4 }), c2w);
+	c2w = torch::matmul(torch::from_blob(data, { 4, 4 }), c2w);
+	c2w[0][3] = c2w[0][3] + x;	//put
+	c2w[1][3] = c2w[1][3] + y;
+	c2w[2][3] = c2w[2][3] + z;
 	return c2w;
+}
+
+//Р—Р°РґР°С‚СЊ РєР°Р»РёР±СЂРѕРІРєРё РєР°РјРµСЂС‹
+inline torch::Tensor GetCalibrationMatrix(const float focal, const float w, const float h)
+{
+	float kdata[] = { focal, 0, 0.5f * w,
+		0, focal, 0.5f * h,
+		0, 0, 1 };
+	return torch::from_blob(kdata, { 3, 3 }/*, torch::kFloat32*/);
 }
 
 ///
 struct CompactData {
+	int H{0}, W{0};
+	float Focal{0},
+		Near{0},
+		Far{0};
+	std::vector<int> SplitsIdx = { 0,0,0 };
+	std::vector<std::string> Splits = { "train", "val", "test" };
+	torch::Tensor K{torch::Tensor()},
+		BoundingBox{torch::Tensor()};
 	std::vector<torch::Tensor> Imgs,
 		Poses,
 		RenderPoses;
-	int H{0}, W{0};
-	float Focal{0},
-		Near,
-		Far;
-	std::vector<std::string> Splits = { "train", "val", "test" };
-	std::vector<int> SplitsIdx = { 0,0,0 };
-	torch::Tensor BoundingBox;
 };
 
 ///BoundingBox calculation
-inline torch::Tensor GetBbox3dForBlenderObj(const CompactData &data) 
+inline torch::Tensor GetBbox3dForObj(const CompactData &data) 
 {
-	//Задать калибровки камеры
-	float kdata[] = { data.Focal, 0, 0.5f * data.W,
-		0, data.Focal, 0.5f * data.H,
-		0, 0, 1 };
-	torch::Tensor k = torch::from_blob(kdata, { 3, 3 });
+	////Р—Р°РґР°С‚СЊ РєР°Р»РёР±СЂРѕРІРєРё РєР°РјРµСЂС‹
+	//float kdata[] = { data.Focal, 0, 0.5f * data.W,
+	//	0, data.Focal, 0.5f * data.H,
+	//	0, 0, 1 };
+	//torch::Tensor k = torch::from_blob(kdata, { 3, 3 });
 
 	//torch::Tensor directions = GetDirections(result.H, result.W, k);
-	torch::Tensor min_bound = torch::tensor({ 100.f, 100.f, 100.f }),
-		max_bound = torch::tensor({ -100.f, -100.f, -100.f });
+	torch::Tensor min_bound = torch::tensor({ 1e8f, 1e8f, 1e8f }),
+		max_bound = torch::tensor({ -1e8f, -1e8f, -1e8f });
 
-	std::vector<torch::Tensor> train_poses;
-	std::copy(data.Poses.begin(), std::next(data.Poses.begin(), data.SplitsIdx[0]), std::back_inserter(train_poses));
-
-	for (auto &c2w : train_poses)
+	//std::vector<torch::Tensor> train_poses;
+	//std::copy(data.Poses.begin(), std::next(data.Poses.begin(), data.SplitsIdx[0]), std::back_inserter(train_poses));
+	//for (auto &c2w : train_poses)
+	for (auto c2w = data.Poses.begin(); c2w != std::next(data.Poses.begin(), data.SplitsIdx[0]); c2w++)
 	{
-		auto [rays_o, rays_d] = GetRays(data.H, data.W, k, c2w);		//[800, 800, 3]
-		//цикл по ограничивающим угловым лучам
+		auto [rays_o, rays_d] = GetRays(data.H, data.W, data.K, *c2w);		//[800, 800, 3]
+		//С†РёРєР» РїРѕ РѕРіСЂР°РЅРёС‡РёРІР°СЋС‰РёРј СѓРіР»РѕРІС‹Рј Р»СѓС‡Р°Рј
 		for (auto it : std::vector <std::pair<int, int>>({ {0, 0}, {data.W - 1, 0}, {0, data.H - 1}, {data.W - 1, data.H - 1} }))
 		{
 			auto min_point = rays_o[it.first][it.second] + data.Near * rays_d[it.first][it.second];		//[3]
@@ -152,6 +165,8 @@ inline CompactData load_blender_data(const std::filesystem::path &basedir, const
 					pose[row][col] = (float)val_row[col];
 			}
 			std::cout <<"pose: " << pose << std::endl;
+			//pose.index_put_({ torch::indexing::Slice(torch::indexing::None, 4), -1 }, pose.index({ torch::indexing::Slice(torch::indexing::None, 4), -1 })/10);
+			//std::cout << "pose: " << pose << std::endl;
 			result.Poses.emplace_back(pose);
 		}			//for (auto frame : data["frames"])
 		float camera_angle_x = float(data["camera_angle_x"]);
@@ -174,6 +189,11 @@ inline CompactData load_blender_data(const std::filesystem::path &basedir, const
 	}
 	result.Near = 2.f;
 	result.Far = 6.f;
-	result.BoundingBox = GetBbox3dForBlenderObj(result);		//(train_poses, result.H, result.W, /*near =*/ 2.0f, /*far =*/ 6.0f);
+	float kdata[] = { result.Focal, 0, 0.5f * result.W,
+		0, result.Focal, 0.5f * result.H,
+		0, 0, 1 };
+	result.K = torch::from_blob(kdata, { 3, 3 }, torch::kFloat32);
+	//result.K = GetCalibrationMatrix(result.Focal, result.W, result.H);
+	result.BoundingBox = GetBbox3dForObj(result);		//(train_poses, result.H, result.W, /*near =*/ 2.0f, /*far =*/ 6.0f);
 	return result;
 }
