@@ -182,13 +182,13 @@ int main(int argc, const char* argv[])
 	exparams.calculate_normals = false;
 	exparams.use_pred_normal = false;	//whether to use predicted normals
 	exparams.use_lerf = false;				//use language embedded radiance fields
-	exparams.multires_views = 4;		//log2 of max freq for positional encoding (2D direction)
-	exparams.n_importance = 192;		//number of additional fine samples per ray
+	exparams.multires_views = 7;		//log2 of max freq for positional encoding (2D direction)
+	exparams.n_importance = 192;//192;		//number of additional fine samples per ray
 	exparams.net_depth_fine = 2;		//layers in fine network 8 for classic NeRF, 2/3 for HashNeRF
 	exparams.net_width_fine = 64;		//channels per layer in fine network 256 for classic NeRF, 64 for HashNeRF
 	exparams.num_layers_color = 2;				//for color part of the HashNeRF
 	exparams.hidden_dim_color = 64;			//for color part of the HashNeRF
-	exparams.num_layers_color_fine = 2;	//for color part of the HashNeRF
+	exparams.num_layers_color_fine = 3;	//for color part of the HashNeRF
 	exparams.hidden_dim_color_fine = 64;	//for color part of the HashNeRF
 	exparams.num_layers_normals = 2;			//!!!->2
 	exparams.hidden_dim_normals = 64;
@@ -212,17 +212,13 @@ int main(int argc, const char* argv[])
 	exparams.lang_embed_dim = 768;			//Language embedder head params
 	exparams.path_to_clip = "..//..//RuCLIP//data//ruclip-vit-large-patch14-336";									//Path to RuClip model
 	exparams.path_to_bpe = "..//..//RuCLIP//data//ruclip-vit-large-patch14-336//bpe.model";			//Path to tokenizer
-	exparams.lerf_positives = "stool chair";
-	exparams.lerf_negatives = {"object", "things", "texture"};
+	exparams.lerf_positives = "тарелки";
+	exparams.lerf_negatives = {"объект", "вещи", "текстура"};
 	//NeRFExecutor <LeRFEmbedder<CuHashEmbedder>, CuSHEncoder, LeRF> nerf_executor(exparams);
 	NeRFExecutor <CuHashEmbedder, CuSHEncoder, NeRFSmall> nerf_executor(exparams);
 
 	NeRFExecutorTrainParams params;
-	params.DatasetType = DatasetType::BLENDER;
-	params.DataDir = DATA_DIR;			//input data directory
 	params.BaseDir = "output";			//where to store ckpts and logs
-	params.HalfRes = false;					////load blender synthetic data at 400x400 instead of 800x800
-	params.WhiteBkgr = false;				//set to render synthetic data on a white bkgd (always use for dvoxels)
 	params.RenderOnly = false;			//do not optimize, reload weights and render out render_poses path
 	params.Ndc = false;							//use normalized device coordinates (set for non-forward facing scenes)
 	params.LinDisp = false;					//sampling linearly in disparity rather than depth
@@ -243,6 +239,19 @@ int main(int argc, const char* argv[])
 	params.ReturnRaw = false;
 	params.RenderFactor = 0;
 	params.PrecorpFrac = 0.5f;
+	params.PyramidClipEmbeddingSaveDir = DATA_DIR;			//
 
-	nerf_executor.Train(params);
+	CompactData data = nerf_executor.LoadData(DATA_DIR, DatasetType::BLENDER, 
+		false,			///load blender synthetic data at 400x400 instead of 800x800
+		params.TestSkip,
+		false				///set to render synthetic data on a white bkgd (always use for dvoxels)
+	);
+	///!!!Сделать нормальное копирование, так как эти тензоры заполняются внутри
+	float kdata[] = { data.Focal, 0, 0.5f * data.W,
+		0, data.Focal, 0.5f * data.H,
+		0, 0, 1 };
+	data.K = torch::from_blob(kdata, { 3, 3 }, torch::kFloat32);
+	//data.K = GetCalibrationMatrix(data.Focal, data.W, data.H).clone().detach();
+	data.BoundingBox = GetBbox3dForObj(data).clone().detach();
+	nerf_executor.Train(data, params);
 }

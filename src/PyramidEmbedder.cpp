@@ -28,22 +28,12 @@ std::list<std::tuple<int, int, int, int, float, float>> PyramidEmbedding :: GetN
 
 	float temp;
 
-	if (std::modf(hor_pos, &temp) >= 0.5*(1.f - properties.Overlap))
-	{
-		hor_pos_idx1 = static_cast<int>(hor_pos);
-		hor_pos_idx2 = static_cast<int>(hor_pos + 1);
-	} else {
-		hor_pos_idx1 = static_cast<int>(hor_pos - 1);
-		hor_pos_idx2 = static_cast<int>(hor_pos);
-	}
-	if (std::modf(vert_pos, &temp) >= 0.5*(1.f - properties.Overlap))
-	{
-		vert_pos_idx1 = static_cast<int>(vert_pos);
-		vert_pos_idx2 = static_cast<int>(vert_pos + 1);
-	} else {
-		vert_pos_idx1 = static_cast<int>(vert_pos - 1);
-		vert_pos_idx2 = static_cast<int>(vert_pos);
-	}
+	hor_pos_idx1 = static_cast<int>(hor_pos - 1);
+	hor_pos_idx2 = static_cast<int>(hor_pos);
+
+	vert_pos_idx1 = static_cast<int>(vert_pos - 1);
+	vert_pos_idx2 = static_cast<int>(vert_pos);
+
 
 	if (hor_pos_idx1 < 0) hor_pos_idx1 = 0;
 	if (hor_pos_idx1 > nw) hor_pos_idx1 = nw;
@@ -86,7 +76,7 @@ std::list<std::tuple<int, int, int, int, float, float>> PyramidEmbedding :: GetN
 
 	//cv::rectangle(test_img, cv::Point(x-1,y-1), cv::Point(x+1, y+1), cv::Scalar(255,255,255));
 	//cv::imshow("test_img", test_img);
-	//cv::waitKey(1);
+	//cv::waitKey(0);
 
 	return result;
 }		//PyramidEmbedding :: GetNearestPatchIndicesSingleScale
