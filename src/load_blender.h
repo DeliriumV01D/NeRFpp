@@ -2,7 +2,7 @@
 
 #include "json.hpp"
 #include "TorchHeader.h"
-#include "BaseNeRFRenderer.h"
+#include "NeRFRenderer.h"
 //#include "RayUtils.h"
 
 #include <filesystem>
@@ -81,6 +81,7 @@ struct CompactData {
 	std::vector<std::string> Splits = { "train", "val", "test" };
 	torch::Tensor K{torch::Tensor()},
 		BoundingBox{torch::Tensor()};
+	cv::Mat d { cv::Mat::zeros(5, 1, CV_64F) };		//k1,k2,k3,p1,p2 коэффициенты дисторсии
 	std::vector<torch::Tensor> Imgs,
 		Poses,
 		RenderPoses;

@@ -28,21 +28,21 @@ std::list<std::tuple<int, int, int, int, float, float>> PyramidEmbedding :: GetN
 
 	float temp;
 
-	hor_pos_idx1 = static_cast<int>(hor_pos - 1);
-	hor_pos_idx2 = static_cast<int>(hor_pos);
+	hor_pos_idx1 = static_cast<int>(hor_pos - 2);
+	hor_pos_idx2 = static_cast<int>(hor_pos - 1);
 
-	vert_pos_idx1 = static_cast<int>(vert_pos - 1);
-	vert_pos_idx2 = static_cast<int>(vert_pos);
+	vert_pos_idx1 = static_cast<int>(vert_pos - 2);
+	vert_pos_idx2 = static_cast<int>(vert_pos - 1);
 
 
 	if (hor_pos_idx1 < 0) hor_pos_idx1 = 0;
-	if (hor_pos_idx1 > nw) hor_pos_idx1 = nw;
+	if (hor_pos_idx1 >= nw) hor_pos_idx1 = nw - 1;
 	if (hor_pos_idx2 < 0) hor_pos_idx2 = 0;
-	if (hor_pos_idx2 > nw) hor_pos_idx2 = nw;
+	if (hor_pos_idx2 >= nw) hor_pos_idx2 = nw - 1;
 	if (vert_pos_idx1 < 0) vert_pos_idx1 = 0;
-	if (vert_pos_idx1 > nh) vert_pos_idx1 = nh;
+	if (vert_pos_idx1 >= nh) vert_pos_idx1 = nh - 1;
 	if (vert_pos_idx2 < 0) vert_pos_idx2 = 0;
-	if (vert_pos_idx2 > nh) vert_pos_idx2 = nh;
+	if (vert_pos_idx2 >= nh) vert_pos_idx2 = nh - 1;
 
 	cv::Point2f p1((hor_pos_idx1 != nw ? static_cast<int>(hor_pos_idx1 * window_rect.width * (1. - properties.Overlap)) : static_cast<int>(img_size.width - window_rect.width)),
 			(vert_pos_idx1 != nh ? static_cast<int>(vert_pos_idx1 * window_rect.height * (1. - properties.Overlap)) : static_cast<int>(img_size.height - window_rect.height))),
@@ -59,6 +59,7 @@ std::list<std::tuple<int, int, int, int, float, float>> PyramidEmbedding :: GetN
 	result.push_back({hor_pos_idx1, vert_pos_idx2, zoom_out_idx, data_img_id, p3.x + window_rect.width/2, p3.y + window_rect.height/2});
 	result.push_back({hor_pos_idx2, vert_pos_idx2, zoom_out_idx, data_img_id, p4.x + window_rect.width/2, p4.y + window_rect.height/2});
 
+	////test
 	//cv::Mat test_img(800, 800, CV_8UC3, cv::Scalar(0,0,0));
 	//std::cout<<x<<" "<<y<<" "<<hor_pos<<" "<<hor_pos_idx1<<" "<<hor_pos_idx2<<" "<<vert_pos<<" "<<vert_pos_idx1<<" "<<vert_pos_idx2<<" "<<zoom_out_idx<<std::endl;
 
@@ -125,8 +126,51 @@ torch::Tensor PyramidEmbedding :: Interpolate(
 	const int data_img_id,
 	const float x1, const float x2, const float y1, const float y2,
 	const float x,
-	const float y
+	const float y,
+	const cv::Size &img_size
 )	{
+	//auto r = (x-x1) * (x-x1) + (y-y1) * (y-y1);
+	//auto result = Embeddings[{hor_pos_idx1, vert_pos_idx1, zoom_out_idx1, data_img_id}];
+
+	//auto r1 = (x-x2) * (x-x2) + (y-y1) * (y-y1);
+	//if (r1 < r)
+	//{
+	//	r = r1;
+	//	result = Embeddings[{hor_pos_idx2, vert_pos_idx1, zoom_out_idx1, data_img_id}];
+	//}
+
+	//r1 = (x-x1) * (x-x1) + (y-y2) * (y-y2);
+	//if (r1 < r)
+	//{
+	//	r = r1;
+	//	result = Embeddings[{hor_pos_idx1, vert_pos_idx2, zoom_out_idx1, data_img_id}];
+	//}
+
+	//r1 = (x-x2) * (x-x2) + (y-y2) * (y-y2);
+	//if (r1 < r)
+	//{
+	//	r = r1;
+	//	result = Embeddings[{hor_pos_idx2, vert_pos_idx2, zoom_out_idx1, data_img_id}];
+	//}
+
+	////r1 = (x - 0) * (x - 0);
+	////if (r1 < r)
+	////	result = zeros_like(result);
+
+	////r1 = (y - 0) * (y - 0);
+	////if (r1 < r)
+	////	result = zeros_like(result);
+
+	////r1 = (x - img_size.width) * (x - img_size.width);
+	////if (r1 < r)
+	////	result = zeros_like(result);
+
+	////r1 = (y - img_size.height) * (y - img_size.height);
+	////if (r1 < r)
+	////	result = zeros_like(result);
+
+	//return result;
+		
 	if (x2 == x1 && y2 == y1)
 		return Embeddings[{hor_pos_idx1, vert_pos_idx1, zoom_out_idx1, data_img_id}];
 		
@@ -231,7 +275,8 @@ torch::Tensor PyramidEmbedding :: GetPixelValue(
 			zoom_out_idx1, zoom_out_idx2, data_img_id,
 			x1, x2, y1, y2,
 			x,
-			y);
+			y, 
+			img_size);
 		zoom_out1 = zoom_out_idx1;
 	}
 	{
@@ -244,7 +289,8 @@ torch::Tensor PyramidEmbedding :: GetPixelValue(
 			zoom_out_idx1, zoom_out_idx2, data_img_id,
 			x1, x2, y1, y2,
 			x,
-			y);
+			y,
+			img_size);
 		zoom_out2 = zoom_out_idx2;
 	}
 
@@ -329,6 +375,7 @@ std::tuple<int, int, int, int, cv::Mat> PyramidEmbedder :: GetNextSample(const C
 	bool found = true;
 	std::tuple<int, int, int, int, cv::Mat> result;
 
+
 	if (!DataImage.empty())
 	{
 		window_rect.width = Properties.ImgSize.width * pow(2, ZoomOutIdx);
@@ -342,15 +389,16 @@ std::tuple<int, int, int, int, cv::Mat> PyramidEmbedder :: GetNextSample(const C
 		int nw = static_cast<int>((w - window_rect.width * Properties.Overlap)/(window_rect.width * (1. - Properties.Overlap)));
 		int nh = static_cast<int>((h - window_rect.height * Properties.Overlap)/(window_rect.height * (1. - Properties.Overlap)));
 
-		if (HorPosIdx != nw)
-			window_rect.x = static_cast<int>(HorPosIdx * window_rect.width * (1. - Properties.Overlap));
-		else
-			window_rect.x = static_cast<int>(w - window_rect.width);
 
-		if (VertPosIdx != nh)
+		//if (HorPosIdx != nw)
+			window_rect.x = static_cast<int>(HorPosIdx * window_rect.width * (1. - Properties.Overlap));
+		//else
+		//	window_rect.x = static_cast<int>(w - window_rect.width);
+
+		//if (VertPosIdx != nh)
 			window_rect.y = static_cast<int>(VertPosIdx * window_rect.height * (1. - Properties.Overlap));
-		else
-			window_rect.y = static_cast<int>(h - window_rect.height);
+		//else
+		//	window_rect.y = static_cast<int>(h - window_rect.height);
 
 		if (found)
 		{
@@ -363,14 +411,23 @@ std::tuple<int, int, int, int, cv::Mat> PyramidEmbedder :: GetNextSample(const C
 		}
 		result = {HorPosIdx, VertPosIdx, ZoomOutIdx, DataImageIdx, sample};
 
+		////test
+		//cv::Mat test_img(800, 800, CV_8UC3, cv::Scalar(0,0,0));
+		//std::cout<<window_rect.x<<" "<<window_rect.y<<" "<<HorPosIdx<<" "<<VertPosIdx<<" "<<ZoomOutIdx<<" "<<DataImageIdx<<std::endl;
+		//cv::rectangle(test_img, cv::Rect(window_rect), cv::Scalar(255,100,100));
+		//cv::rectangle(test_img, cv::Rect(window_rect.x + window_rect.width/2 - 1, window_rect.y + window_rect.height/2 - 1, 3, 3), cv::Scalar(255,100,100));
+		//cv::imshow("sample", sample);
+		//cv::imshow("test_img", test_img);
+		//cv::waitKey(0);
+
 		//Циклы по вертикальным и горизонтальным позициям
 		VertPosIdx++;
-		if (VertPosIdx == nh + 1)
+		if (VertPosIdx == nh /*+ 1*/)
 		{
 			VertPosIdx = 0;
 
 			HorPosIdx++;
-			if (HorPosIdx == nw + 1)
+			if (HorPosIdx == nw /*+ 1*/)
 			{
 				HorPosIdx = 0;
 

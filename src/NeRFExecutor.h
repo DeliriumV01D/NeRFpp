@@ -8,8 +8,11 @@
 #include "PyramidEmbedder.h"
 #include "NeRF.h"
 #include "LeRF.h"
+#include "LeRFRenderer.h"
+#include "NeRFactor.h"
+#include "NeRFactorRenderer.h"
 #include "Sampler.h"
-#include "BaseNeRFRenderer.h"
+#include "NeRFRenderer.h"
 #include "TRandomInt.h"
 
 #include <set>
@@ -37,10 +40,11 @@ struct NeRFExecutorParams {
 		hidden_dim_normals{ 64 },
 		geo_feat_dim{ 15 };
 	//torch::Tensor bounding_box = torch::tensor({ -4.f, -4.f, -4.f, 4.f, 4.f, 4.f });
-	bool use_viewdirs{ true },	//use full 5D input instead of 3D. Не всегда нужна зависимость от направления обзора + обучение быстрее процентов на 30.
+	bool use_nerf{ true },
+		use_viewdirs{ true },	//use full 5D input instead of 3D. Не всегда нужна зависимость от направления обзора + обучение быстрее процентов на 30.
 		calculate_normals{ false },
-		use_pred_normal{ true },	//whether to use predicted normals
-		use_lerf{ true };
+		use_pred_normal{ false },	//whether to use predicted normals
+		use_lerf{ false };
 	int n_levels{ 16 },											//for color density embedder
 		n_features_per_level{ 2 },						//for color density embedder
 		log2_hashmap_size{ 19 },							//for color density embedder
@@ -54,9 +58,11 @@ struct NeRFExecutorParams {
 		clip_input_img_size{ 336 },	//Input RuClip model size
 		num_layers_le{ 3 },					//Language embedder head params
 		hidden_dim_le{ 64 },				//Language embedder head params
-		lang_embed_dim{ 768 };			//Language embedder head params
+		lang_embed_dim{ 768 },			//Language embedder head params
+		geo_feat_dim_le{ 32 };			//Language embedder head params
 	torch::Device device{ torch::kCUDA };
-	float learning_rate{ 5e-4 };
+	float learning_rate{ 5e-4 },
+		pyr_embedder_overlap{0.75};
 	std::filesystem::path ft_path,
 		path_to_clip,			//Path to RuClip model
 		path_to_bpe;			//Path to tokenizer
@@ -91,14 +97,63 @@ struct NeRFExecutorTrainParams {
 };
 
 
-template <typename TEmbedder, typename TEmbedDirs, typename TNeRF>
+inline CompactData LoadData (
+	const std::filesystem::path &basedir,
+	const torch::Device &device,
+	DatasetType dataset_type = DatasetType::BLENDER,
+	bool half_res = false,				///load blender synthetic data at 400x400 instead of 800x800
+	bool test_skip = false,				///will load 1/N images from test/val sets, useful for large datasets like deepvoxels
+	bool white_bkgr = false				///set to render synthetic data on a white bkgd (always use for dvoxels)
+)	{
+	CompactData data;
+	//Загрузить данные
+	if (dataset_type == DatasetType::BLENDER)
+	{
+		data = load_blender_data(basedir, half_res, test_skip);
+		//!!!Тут K and BoundingBox поломано, поэтому ниже все повторно заполняется
+		std::cout << "Loaded blender " << data.Imgs.size() << " " << data.RenderPoses.size() << " " << data.H << " " << data.W << " " << data.Focal << " " << basedir;
+		std::cout << "data.Imgs[0]: " << data.Imgs[0].sizes() << " " << data.Imgs[0].device() << " " << data.Imgs[0].type() << std::endl;
+		//i_train, i_val, i_test = i_split;
+
+		for (auto &img : data.Imgs)
+		{
+			if (white_bkgr)
+				img = img.index({ "...", torch::indexing::Slice(torch::indexing::None, 3) }) * img.index({ "...", torch::indexing::Slice(-1, torch::indexing::None) }) + (1. - img.index({ "...", torch::indexing::Slice(-1, torch::indexing::None) }));
+			else
+				img = img.index({ "...", torch::indexing::Slice(torch::indexing::None, 3) });
+		}
+	}
+
+	///!!!Сделать нормальное копирование, так как эти тензоры заполняются внутри
+	float kdata[] = { data.Focal, 0, 0.5f * data.W,
+		0, data.Focal, 0.5f * data.H,
+		0, 0, 1 };
+	data.K = torch::from_blob(kdata, { 3, 3 }, torch::kFloat32);
+	//data.K = GetCalibrationMatrix(data.Focal, data.W, data.H).clone().detach();
+	data.BoundingBox = GetBbox3dForObj(data).clone().detach();
+		
+	//Move testing data to GPU
+	for (auto &it : data.RenderPoses)
+		it = it.to(device);
+
+	return data;
+}
+
+
+template <typename TEmbedder, typename TEmbedDirs, typename TNeRF, typename TNeRFRenderer,
+typename TLeRFEmbedder, typename TLeRF, typename TLeRFRenderer>
 class NeRFExecutor {
 protected:
 	NeRFExecutorParams Params;
 	TEmbedder ExecutorEmbedder = nullptr;
 	TEmbedDirs ExecutorEmbeddirs = nullptr;
+	TLeRFEmbedder LangEmbedder = nullptr;
 	TNeRF Model = nullptr,
 		ModelFine = nullptr;
+	TLeRF LangModel = nullptr,
+		LangModelFine = nullptr;
+	std::unique_ptr<TNeRFRenderer> NeRFRenderer = nullptr;
+	std::unique_ptr<TLeRFRenderer> LeRFRenderer = nullptr;
 	std::vector<torch::Tensor> GradVars;
 	std::unique_ptr<torch::optim::Adam> Optimizer;
 	int Start = 0,
@@ -109,59 +164,19 @@ protected:
 	CLIP Clip = nullptr;
 	std::shared_ptr<RuCLIPProcessor> ClipProcessor = nullptr;
 	PyramidEmbedding PyramidClipEmbedding;
+	torch::Tensor LerfPositives,
+		LerfNegatives;
 public:
 	NeRFExecutor(const NeRFExecutorParams &params) : Params(params), Device(params.device), NImportance(params.n_importance), UseViewDirs(params.use_viewdirs), LearningRate(params.learning_rate){};
 	void Initialize(const NeRFExecutorParams &params, torch::Tensor bounding_box);
 	
-	CompactData LoadData (
-		const std::filesystem::path &basedir,
-		DatasetType dataset_type = DatasetType::BLENDER,
-		bool half_res = false,				///load blender synthetic data at 400x400 instead of 800x800
-		bool test_skip = false,				///will load 1/N images from test/val sets, useful for large datasets like deepvoxels
-		bool white_bkgr = false				///set to render synthetic data on a white bkgd (always use for dvoxels)
-	)	{
-		CompactData data;
-		//Загрузить данные
-		if (dataset_type == DatasetType::BLENDER)
-		{
-			data = load_blender_data(basedir, half_res, test_skip);
-			//!!!Тут K and BoundingBox поломано, поэтому ниже все повторно заполняется
-			std::cout << "Loaded blender " << data.Imgs.size() << " " << data.RenderPoses.size() << " " << data.H << " " << data.W << " " << data.Focal << " " << basedir;
-			std::cout << "data.Imgs[0]: " << data.Imgs[0].sizes() << " " << data.Imgs[0].device() << " " << data.Imgs[0].type() << std::endl;
-			//i_train, i_val, i_test = i_split;
-
-			for (auto &img : data.Imgs)
-			{
-				if (white_bkgr)
-					img = img.index({ "...", torch::indexing::Slice(torch::indexing::None, 3) }) * img.index({ "...", torch::indexing::Slice(-1, torch::indexing::None) }) + (1. - img.index({ "...", torch::indexing::Slice(-1, torch::indexing::None) }));
-				else
-					img = img.index({ "...", torch::indexing::Slice(torch::indexing::None, 3) });
-			}
-		}
-
-		///!!!Сделать нормальное копирование, так как эти тензоры заполняются внутри
-		float kdata[] = { data.Focal, 0, 0.5f * data.W,
-			0, data.Focal, 0.5f * data.H,
-			0, 0, 1 };
-		data.K = torch::from_blob(kdata, { 3, 3 }, torch::kFloat32);
-		//data.K = GetCalibrationMatrix(data.Focal, data.W, data.H).clone().detach();
-		data.BoundingBox = GetBbox3dForObj(data).clone().detach();
-		
-		//Move testing data to GPU
-		for (auto &it : data.RenderPoses)
-			it = it.to(Device);
-
-		return data;
-	}
-
-
 	///
-	RenderResult RenderView(
+	std::tuple <NeRFRenderResult, LeRFRenderResult> RenderView(
 		const torch::Tensor render_pose,	//rays?  	std::pair<torch::Tensor, torch::Tensor> rays = { torch::Tensor(), torch::Tensor() };			///array of shape[2, batch_size, 3].Ray origin and direction for each example in batch.
 		int w,
 		int h,
 		const torch::Tensor k,
-		const RenderParams &rparams
+		const NeRFRenderParams &rparams
 	);
 
 	///
@@ -171,7 +186,7 @@ public:
 		int w,
 		float focal,
 		torch::Tensor k,
-		const RenderParams &rparams,
+		const NeRFRenderParams &rparams,
 		std::pair<torch::Tensor, torch::Tensor> rays = { torch::Tensor(), torch::Tensor() },			///array of shape[2, batch_size, 3].Ray origin and direction for each example in batch.
 		//torch::Tensor c2w = torch::Tensor(),			///array of shape[3, 4].Camera - to - world transformation matrix.
 		torch::Tensor c2w_staticcam = torch::Tensor(),			///array of shape[3, 4].If not None, use this transformation matrix for camera while using other c2w argument for viewing directions.
@@ -180,192 +195,265 @@ public:
 	);
 
 	///
+	NeRFRenderParams * FillRenderParams(
+		NeRFExecutorParams executor_params,
+		NeRFExecutorTrainParams executor_train_params,
+		const float Near,
+		const float Far,
+		const bool returm_weights = false,
+		const bool calculate_normals = false
+	);
+
+	///
+	void SetLeRFPrompts(const std::string &lerf_positives, const std::vector<std::string> &lerf_negatives);
+	std::tuple<torch::Tensor, torch::Tensor> GetLeRFPrompts();
+
+	///
 	void Train(const CompactData &data, NeRFExecutorTrainParams &params);
 	NeRFExecutorParams GetParams(){return Params;};
 	torch::Tensor GetEmbedderBoundingBox(){return ExecutorEmbedder->GetBoundingBox();};
+	torch::Tensor GetLangEmbedderBoundingBox(){return LangEmbedder->GetBoundingBox();};
+	void SetLeRFPrompts(torch::Tensor lerf_positives, torch::Tensor lerf_negatives){LerfPositives = lerf_positives; LerfNegatives = lerf_negatives;};
 };				//NeRFExecutor
 
 
+template <typename TEmbedder, typename TEmbedDirs, typename TNeRF, typename TNeRFRenderer,
+typename TLeRFEmbedder, typename TLeRF, typename TLeRFRenderer>
+NeRFRenderParams * NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, TLeRF, TLeRFRenderer> :: FillRenderParams(
+	NeRFExecutorParams executor_params,
+	NeRFExecutorTrainParams executor_train_params,
+	const float Near,
+	const float Far,
+	const bool returm_weights /*= false*/,
+	const bool calculate_normals /*= false*/
+){
+	NeRFRenderParams * render_params;
+
+	//if constexpr (std::is_same_v<TNeRF, NeRFactor>)
+	//{
+	// 	render_params.CalculateNormals = false;
+	//	render_params.UsePredNormal = executor_params.use_pred_normal;
+	//}
+	render_params = new NeRFRenderParams();
+	
+	render_params->NSamples = executor_train_params.NSamples;
+	render_params->NImportance = NImportance;
+	render_params->Chunk = executor_train_params.Chunk;
+	render_params->ReturnRaw = executor_train_params.ReturnRaw;
+	render_params->LinDisp = executor_train_params.LinDisp;
+	render_params->Perturb = 0.f;
+	//render_params.WhiteBkgr = params.WhiteBkgr;
+	render_params->RawNoiseStd = 0.;
+	render_params->Ndc = executor_train_params.Ndc;
+	render_params->Near = Near;
+	render_params->Far = Far;
+	render_params->UseViewdirs = UseViewDirs;
+	render_params->ReturnWeights = returm_weights;
+	render_params->RenderFactor = executor_train_params.RenderFactor;
+
+	return render_params;
+}
+
+
 ///if using hashed for xyz, use SH for views
-template <typename TEmbedder, typename TEmbedDirs, typename TNeRF>
-void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Initialize(const NeRFExecutorParams &params, torch::Tensor bounding_box)
+template <typename TEmbedder, typename TEmbedDirs, typename TNeRF, typename TNeRFRenderer,
+typename TLeRFEmbedder, typename TLeRF, typename TLeRFRenderer>
+void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, TLeRF, TLeRFRenderer> :: Initialize(const NeRFExecutorParams &params, torch::Tensor bounding_box)
 {
 	int input_ch,
 		input_ch_views = 0;
-	if constexpr (std::is_same_v<TEmbedder, Embedder>)
-		ExecutorEmbedder = Embedder("embedder", params.multires);
-	if constexpr (std::is_same_v<TEmbedder, HashEmbedder>)
-		ExecutorEmbedder = HashEmbedder("embedder", bounding_box.to(Device), params.n_levels, params.n_features_per_level, params.log2_hashmap_size, params.base_resolution, params.finest_resolution);
-	if constexpr (std::is_same_v<TEmbedder, CuHashEmbedder>)
-		ExecutorEmbedder = CuHashEmbedder("embedder", bounding_box.to(Device), params.n_levels, params.n_features_per_level, params.log2_hashmap_size, params.base_resolution, params.finest_resolution);
-	if constexpr (std::is_same_v<TEmbedder, LeRFEmbedder<CuHashEmbedder>>)
-		ExecutorEmbedder = LeRFEmbedder<CuHashEmbedder>("embedder", bounding_box.to(Device), params.n_levels, params.n_features_per_level, params.log2_hashmap_size, params.base_resolution, params.finest_resolution,
-			params.n_levels_le, params.n_features_per_level_le, params.log2_hashmap_size_le, params.base_resolution_le, params.finest_resolution_le);
+	if (params.use_nerf)
+	{
+		if constexpr (std::is_same_v<TEmbedder, Embedder>)
+			ExecutorEmbedder = Embedder("embedder", params.multires);
+		if constexpr (std::is_same_v<TEmbedder, HashEmbedder>)
+			ExecutorEmbedder = HashEmbedder("embedder", bounding_box.to(Device), params.n_levels, params.n_features_per_level, params.log2_hashmap_size, params.base_resolution, params.finest_resolution);
+		if constexpr (std::is_same_v<TEmbedder, CuHashEmbedder>)
+			ExecutorEmbedder = CuHashEmbedder("embedder", bounding_box.to(Device), params.n_levels, params.n_features_per_level, params.log2_hashmap_size, params.base_resolution, params.finest_resolution);
 
-	ExecutorEmbedder->to(params.device);
-	input_ch = ExecutorEmbedder->GetOutputDims();
-	auto embp = ExecutorEmbedder->parameters();
-	GradVars.insert(GradVars.end(), std::make_move_iterator(embp.begin()), std::make_move_iterator(embp.end()));		//!!!
+		ExecutorEmbedder->to(params.device);
+		input_ch = ExecutorEmbedder->GetOutputDims();
+		auto embp = ExecutorEmbedder->parameters();
+		GradVars.insert(GradVars.end(), std::make_move_iterator(embp.begin()), std::make_move_iterator(embp.end()));		//!!!
 	
-	for (auto &k : ExecutorEmbedder->named_parameters())
-		std::cout << k.key() << std::endl;
-	std::cout << "ExecutorEmbedder params count: " << Trainable::ParamsCount(ExecutorEmbedder) << std::endl;
+		for (auto &k : ExecutorEmbedder->named_parameters())
+			std::cout << k.key() << std::endl;
+		std::cout << "ExecutorEmbedder params count: " << Trainable::ParamsCount(ExecutorEmbedder) << std::endl;
 
-	if (params.use_viewdirs)
-	{
-		if constexpr (std::is_same_v<TEmbedDirs, Embedder>)
-			ExecutorEmbeddirs = Embedder("embeddirs", params.multires_views);
-		if constexpr (std::is_same_v<TEmbedDirs, HashEmbedder>)   //!!!if using hashed for xyz, use SH for views
-			ExecutorEmbeddirs = SHEncoder("embeddirs", 3, 4);
-		if constexpr (std::is_same_v<TEmbedDirs, SHEncoder>)
-			ExecutorEmbeddirs = SHEncoder("embeddirs", 3, 4);
-		if constexpr (std::is_same_v<TEmbedDirs, CuSHEncoder>)
-			ExecutorEmbeddirs = CuSHEncoder("embeddirs", 3, params.multires_views);
-		input_ch_views = ExecutorEmbeddirs->GetOutputDims();
-		ExecutorEmbeddirs->to(params.device);
-	}
-
-	int output_ch = (params.n_importance > 0) ? 5 : 4;
-	const std::set<int> skips = std::set<int>{ 4 };
-
-	if constexpr (std::is_same_v<TNeRF, NeRF>)
-		Model = NeRF(params.net_depth, params.net_width, input_ch, input_ch_views, output_ch, skips, params.use_viewdirs, "model");
-
-	if constexpr (std::is_same_v<TNeRF, NeRFSmall>)
-	{
-		Model = NeRFSmall(
-			params.net_depth,
-			params.net_width,
-			params.geo_feat_dim,
-			params.num_layers_color,
-			params.hidden_dim_color,
-			(params.n_importance == 0) && params.use_pred_normal,		//В грубой сети не учим нормали, поэтому проверим нет ли тонкой сети
-			params.num_layers_normals,
-			params.hidden_dim_normals,
-			input_ch,
-			input_ch_views,
-			"model"
-		);
-	}
-
-	if constexpr (std::is_same_v<TNeRF, LeRF>)
-	{
-		Model = LeRF(		
-			params.net_depth,
-			params.net_width,
-			params.geo_feat_dim,
-			params.num_layers_color,
-			params.hidden_dim_color,
-			(params.n_importance == 0) && params.use_pred_normal,		//В грубой сети не учим нормали, поэтому проверим нет ли тонкой сети
-			params.num_layers_normals,
-			params.hidden_dim_normals,
-			input_ch,
-			input_ch_views,
-			(params.n_importance == 0)?params.num_layers_le:0,
-			(params.n_importance == 0)?params.hidden_dim_le:0,
-			(params.n_importance == 0)?params.lang_embed_dim:0,
-			ExecutorEmbedder->GetOutputDimsLE(),/*input_ch_le,*/
-			"model"
-		);
-	}
-
-	Model->to(params.device);
-	auto mp = Model->parameters();
-	GradVars.insert(GradVars.end(), std::make_move_iterator(mp.begin()), std::make_move_iterator(mp.end()));		//!!!
-
-	for (auto &k : Model->named_parameters())
-		std::cout << k.key() << std::endl;
-	std::cout << "Model params count: " << Trainable::ParamsCount(Model) << std::endl;
-
-	if (params.n_importance > 0)
-	{
-		if constexpr (std::is_same_v<TNeRF, NeRF>)
-			ModelFine = NeRF(params.net_depth_fine, params.net_width_fine, input_ch, input_ch_views, output_ch, skips, params.use_viewdirs, "model_fine");
-		
-		if constexpr (std::is_same_v<TNeRF, NeRFSmall>)
+		if (params.use_viewdirs)
 		{
-			ModelFine = NeRFSmall(
-				params.net_depth_fine,
-				params.net_width_fine,
-				params.geo_feat_dim,
-				params.num_layers_color_fine,
-				params.hidden_dim_color_fine,
-				params.use_pred_normal,
-				params.num_layers_normals,
-				params.hidden_dim_normals,
-				input_ch,
-				input_ch_views,
-				"model_fine"
-			);
+			if constexpr (std::is_same_v<TEmbedDirs, Embedder>)
+				ExecutorEmbeddirs = Embedder("embeddirs", params.multires_views);
+			if constexpr (std::is_same_v<TEmbedDirs, HashEmbedder>)   //!!!if using hashed for xyz, use SH for views
+				ExecutorEmbeddirs = SHEncoder("embeddirs", 3, 4);
+			if constexpr (std::is_same_v<TEmbedDirs, SHEncoder>)
+				ExecutorEmbeddirs = SHEncoder("embeddirs", 3, 4);
+			if constexpr (std::is_same_v<TEmbedDirs, CuSHEncoder>)
+				ExecutorEmbeddirs = CuSHEncoder("embeddirs", 3, params.multires_views);
+			input_ch_views = ExecutorEmbeddirs->GetOutputDims();
+			ExecutorEmbeddirs->to(params.device);
 		}
+	}	//if use_nerf
 
-		if constexpr (std::is_same_v<TNeRF, LeRF>)
-		{
-			ModelFine = LeRF(
-				params.net_depth_fine,
-				params.net_width_fine,
+	if (params.use_lerf)
+	{
+		if constexpr (std::is_same_v<TLeRFEmbedder, CuHashEmbedder>)
+			LangEmbedder = CuHashEmbedder("lang_embedder", bounding_box.to(Device), params.n_levels_le, params.n_features_per_level_le, params.log2_hashmap_size_le, params.base_resolution_le, params.finest_resolution_le);
+
+		LangEmbedder->to(params.device);
+		auto embp = LangEmbedder->parameters();
+		GradVars.insert(GradVars.end(), std::make_move_iterator(embp.begin()), std::make_move_iterator(embp.end()));		//!!!
+	
+		for (auto &k : LangEmbedder->named_parameters())
+			std::cout << k.key() << std::endl;
+		std::cout << "LangEmbedder params count: " << Trainable::ParamsCount(LangEmbedder) << std::endl;
+	}	//if use_lerf
+
+	if (params.use_nerf)
+	{
+		int output_ch = (params.n_importance > 0) ? 5 : 4;
+		const std::set<int> skips = std::set<int>{ 4 };
+
+		if constexpr (std::is_same_v<TNeRF, NeRF>)
+			Model = NeRF(params.net_depth, params.net_width, input_ch, input_ch_views, output_ch, skips, params.use_viewdirs, "model");
+
+		if constexpr (std::is_same_v<TNeRF, NeRFSmall>)
+			Model = NeRFSmall(
+				params.net_depth,
+				params.net_width,
 				params.geo_feat_dim,
-				params.num_layers_color_fine,
-				params.hidden_dim_color_fine,
-				params.use_pred_normal,
+				params.num_layers_color,
+				params.hidden_dim_color,
+				(params.n_importance == 0) && params.use_pred_normal,		//В грубой сети не учим нормали, поэтому проверим нет ли тонкой сети
 				params.num_layers_normals,
 				params.hidden_dim_normals,
 				input_ch,
 				input_ch_views,
+				"model"
+			);
+
+		Model->to(params.device);
+		auto mp = Model->parameters();
+		GradVars.insert(GradVars.end(), std::make_move_iterator(mp.begin()), std::make_move_iterator(mp.end()));		//!!!
+
+		for (auto &k : Model->named_parameters())
+			std::cout << k.key() << std::endl;
+		std::cout << "Model params count: " << Trainable::ParamsCount(Model) << std::endl;
+
+		if (params.n_importance > 0)
+		{
+			if constexpr (std::is_same_v<TNeRF, NeRF>)
+				ModelFine = NeRF(params.net_depth_fine, params.net_width_fine, input_ch, input_ch_views, output_ch, skips, params.use_viewdirs, "model_fine");
+		
+			if constexpr (std::is_same_v<TNeRF, NeRFSmall>)
+				ModelFine = NeRFSmall(
+					params.net_depth_fine,
+					params.net_width_fine,
+					params.geo_feat_dim,
+					params.num_layers_color_fine,
+					params.hidden_dim_color_fine,
+					params.use_pred_normal,
+					params.num_layers_normals,
+					params.hidden_dim_normals,
+					input_ch,
+					input_ch_views,
+					"model_fine"
+				);
+
+			ModelFine->to(params.device);
+			auto temp = ModelFine->parameters();
+			GradVars.insert(GradVars.end(), std::make_move_iterator(temp.begin()), std::make_move_iterator(temp.end()));
+
+			for (auto& k : ModelFine->named_parameters())
+				std::cout << k.key() << std::endl;
+			std::cout << "ModelFine params count: " << Trainable::ParamsCount(ModelFine) << std::endl;
+		}		//if n_importance > 0
+	}	//if use_nerf
+
+	if (params.use_lerf)
+	{
+		//if constexpr (std::is_same_v<TLeRF, LeRF>)
+			LangModel = TLeRF(		
+				params.geo_feat_dim_le,
 				params.num_layers_le,
 				params.hidden_dim_le,
 				params.lang_embed_dim,
-				ExecutorEmbedder->GetOutputDimsLE(),/*input_ch_le,*/
-				"model_fine"
+				LangEmbedder->GetOutputDims(),/*input_ch_le,*/
+				"lang_model"
 			);
-		}
 
-		ModelFine->to(params.device);
-		auto temp = ModelFine->parameters();
-		GradVars.insert(GradVars.end(), std::make_move_iterator(temp.begin()), std::make_move_iterator(temp.end()));
+		LangModel->to(params.device);
+		auto mp = LangModel->parameters();
+		GradVars.insert(GradVars.end(), std::make_move_iterator(mp.begin()), std::make_move_iterator(mp.end()));		//!!!
 
-		for (auto& k : ModelFine->named_parameters())
+		for (auto &k : LangModel->named_parameters())
 			std::cout << k.key() << std::endl;
-		std::cout << "ModelFine params count: " << Trainable::ParamsCount(ModelFine) << std::endl;
+		std::cout << "LangModel params count: " << Trainable::ParamsCount(LangModel) << std::endl;
+	}	//if use_lerf
+
+	if (params.use_nerf)
+	{
+		//if constexpr (std::is_same_v<TNeRFRenderer, NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF>>)
+			NeRFRenderer = std::make_unique<TNeRFRenderer> (ExecutorEmbedder, ExecutorEmbeddirs, Model, ModelFine);
 	}
 
-	if constexpr (std::is_same_v<TNeRF, NeRF>)
-		Optimizer = std::make_unique<torch::optim::Adam>(GradVars, torch::optim::AdamOptions(params.learning_rate).eps(1e-7)/*.weight_decay(0.001)*/.betas(std::make_tuple(0.9, 0.999)));
+	if (params.use_lerf)
+	{
+		//if constexpr (std::is_same_v<TLeRFRenderer, LeRFRenderer>)
+			LeRFRenderer = std::make_unique<TLeRFRenderer> (LangEmbedder, LangModel, LangModelFine);
+	}
 
-	if constexpr (std::is_same_v<TNeRF, NeRFSmall> && std::is_same_v<TEmbedder, HashEmbedder>)	//!!!RAdam
-		//torch::optim::SGD generator_optimizer(generator->parameters(), torch::optim::SGDOptions(1e-4).weight_decay(0.001));
-		//Optimizer = std::make_unique<torch::optim::Adam>(GradVars, torch::optim::AdamOptions(learning_rate).eps(1e-8)/*.weight_decay(1e-6)*/.betas(std::make_tuple(0.9, 0.999)));
-		Optimizer = std::make_unique<torch::optim::Adam>(GradVars, torch::optim::AdamOptions(params.learning_rate).eps(1e-15).betas(std::make_tuple(0.9, 0.99)));
-
-	if constexpr (std::is_same_v<TNeRF, NeRFSmall> && std::is_same_v<TEmbedder, CuHashEmbedder>)
-		Optimizer = std::make_unique<torch::optim::Adam>(GradVars, torch::optim::AdamOptions(params.learning_rate).eps(1e-15).betas(std::make_tuple(0.9, 0.99)));
-
-	if constexpr (std::is_same_v<TNeRF, LeRF>)//RAdam в оригинале LeRF
-		Optimizer = std::make_unique<torch::optim::Adam>(GradVars, torch::optim::AdamOptions(params.learning_rate).eps(1e-15).betas(std::make_tuple(0.9, 0.99)));
+	//if constexpr (std::is_same_v<TNeRF, NeRF>)
+	//	Optimizer = std::make_unique<torch::optim::Adam>(GradVars, torch::optim::AdamOptions(params.learning_rate).eps(1e-7)/*.weight_decay(0.001)*/.betas(std::make_tuple(0.9, 0.999)));
+	Optimizer = std::make_unique<torch::optim::Adam>(GradVars, torch::optim::AdamOptions(params.learning_rate).eps(1e-15).betas(std::make_tuple(0.9, 0.99)));
 	
 	if (/*Проверить наличие файлов*/
 		std::filesystem::exists(params.ft_path / "start_checkpoint.pt") &&
 		std::filesystem::exists(params.ft_path / "optimizer_checkpoint.pt") &&
-		std::filesystem::exists(params.ft_path / "model_checkpoint.pt") &&
-		(ModelFine.is_empty() || (!ModelFine.is_empty() && std::filesystem::exists(params.ft_path / "model_fine_checkpoint.pt")))
+		((params.use_nerf && std::filesystem::exists(params.ft_path / "model_checkpoint.pt")) || !params.use_nerf) &&
+		((params.use_nerf && params.n_importance > 0 && std::filesystem::exists(params.ft_path / "model_fine_checkpoint.pt")) || !(params.use_nerf && params.n_importance > 0)) &&
+		((params.use_lerf && std::filesystem::exists(params.ft_path / "lang_embedder_checkpoint.pt")) || !params.use_lerf)
 	) {
-		//if constexpr (std::is_same_v<TEmbedder, HashEmbedder> || std::is_same_v<TEmbedder, CuHashEmbedder> || std::is_same_v<TEmbedder, LeRFEmbedder>)
-		if (std::filesystem::exists(params.ft_path / "embedder_checkpoint.pt"))
-			torch::load(ExecutorEmbedder, (params.ft_path / "embedder_checkpoint.pt").string());
-
 		std::cout << "restoring parameters from checkpoint..." << std::endl;
+
+		if (params.use_nerf)
+		{
+			if (std::filesystem::exists(params.ft_path / "embedder_checkpoint.pt"))
+				torch::load(ExecutorEmbedder, (params.ft_path / "embedder_checkpoint.pt").string());
+			torch::load(Model, (params.ft_path / "model_checkpoint.pt").string());
+			if (!ModelFine.is_empty())
+				torch::load(ModelFine, (params.ft_path / "model_fine_checkpoint.pt").string());
+		}
+
+		if (params.use_lerf)
+		{
+			if (std::filesystem::exists(params.ft_path / "lang_embedder_checkpoint.pt"))
+				torch::load(LangEmbedder, (params.ft_path / "lang_embedder_checkpoint.pt").string());
+			torch::load(LangModel, (params.ft_path / "lang_model_checkpoint.pt").string());
+			if (!LangModelFine.is_empty())
+				torch::load(LangModelFine, (params.ft_path / "lang_model_fine_checkpoint.pt").string());
+		}
+
 		torch::Tensor temp;
 		torch::load(temp, (params.ft_path / "start_checkpoint.pt").string());
 		Start = temp.item<float>();
 		torch::load(*Optimizer.get(), (params.ft_path / "optimizer_checkpoint.pt").string());
-		torch::load(Model, (params.ft_path / "model_checkpoint.pt").string());
-		if (!ModelFine.is_empty())
-			torch::load(ModelFine, (params.ft_path / "model_fine_checkpoint.pt").string());
 	} else {
-		ExecutorEmbedder->Initialize();//Trainable::Initialize(ExecutorEmbedder);//ExecutorEmbedder->Initialize();
-		Trainable::Initialize(Model);
-		if (params.n_importance > 0)
-			Trainable::Initialize(ModelFine);
+		if (params.use_nerf)
+		{
+			ExecutorEmbedder->Initialize();//Trainable::Initialize(ExecutorEmbedder);//ExecutorEmbedder->Initialize();	
+			Trainable::Initialize(Model);
+			if (!ModelFine.is_empty())
+				Trainable::Initialize(ModelFine);
+		}
+		
+		if (params.use_lerf)
+		{
+			LangEmbedder->Initialize();
+			Trainable::Initialize(LangModel);
+			if (!LangModelFine.is_empty())
+				Trainable::Initialize(LangModelFine);
+		}
 	}
 
 	if (Params.use_lerf)
@@ -387,13 +475,14 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Initialize(const NeRFExecuto
 
 
 	///
-template <typename TEmbedder, typename TEmbedDirs, typename TNeRF>
-RenderResult NeRFExecutor<TEmbedder, TEmbedDirs, TNeRF> :: RenderView(
+template <typename TEmbedder, typename TEmbedDirs, typename TNeRF, typename TNeRFRenderer,
+typename TLeRFEmbedder, typename TLeRF, typename TLeRFRenderer>
+std::tuple <NeRFRenderResult, LeRFRenderResult> NeRFExecutor<TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, TLeRF, TLeRFRenderer> :: RenderView(
 	const torch::Tensor render_pose,	//rays?  	std::pair<torch::Tensor, torch::Tensor> rays = { torch::Tensor(), torch::Tensor() };			///array of shape[2, batch_size, 3].Ray origin and direction for each example in batch.
 	int w,
 	int h,
 	const torch::Tensor k,
-	const RenderParams &rparams
+	const NeRFRenderParams &rparams
 ){
 	torch::Tensor k1 = k.clone().detach();
 	if (rparams.RenderFactor != 0)
@@ -407,27 +496,41 @@ RenderResult NeRFExecutor<TEmbedder, TEmbedDirs, TNeRF> :: RenderView(
 		k1[1][2] = k1[1][2]/rparams.RenderFactor;
 	}
 
-	return Render(h, w, k1,
-		Model,
-		ExecutorEmbedder,
-		ExecutorEmbeddirs,
-		ModelFine,
-		rparams,
-		/*Rays*/ {torch::Tensor(), torch::Tensor()},
-		render_pose.to(Device).index({ torch::indexing::Slice(torch::indexing::None, 3), torch::indexing::Slice(torch::indexing::None, 4) }),
-		/*rparams.C2wStaticCam*/ torch::Tensor()
-	);
-};		//NeRFExecutor :: RenderView
+	NeRFRenderResult nerf_render_result;
+	LeRFRenderResult lerf_render_result;
+
+	if (Params.use_nerf)
+	{
+		nerf_render_result = NeRFRenderer->Render(h, w, k1,
+			rparams,
+			/*Rays*/ {torch::Tensor(), torch::Tensor()},
+			render_pose.to(Device).index({ torch::indexing::Slice(torch::indexing::None, 3), torch::indexing::Slice(torch::indexing::None, 4) }),
+			/*rparams.C2wStaticCam*/ torch::Tensor()
+		);
+	}
+	if (Params.use_lerf)
+	{
+		lerf_render_result = LeRFRenderer->Render(h, w, k1,
+			rparams,
+			/*Rays*/ {torch::Tensor(), torch::Tensor()},
+			render_pose.to(Device).index({ torch::indexing::Slice(torch::indexing::None, 3), torch::indexing::Slice(torch::indexing::None, 4) }),
+			/*rparams.C2wStaticCam*/ torch::Tensor()
+		);
+	}
+
+	return std::make_tuple(nerf_render_result, lerf_render_result);
+}		//NeRFExecutor :: RenderView
 
 
-template <typename TEmbedder, typename TEmbedDirs, typename TNeRF>
-void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: RenderPath(
+template <typename TEmbedder, typename TEmbedDirs, typename TNeRF, typename TNeRFRenderer,
+typename TLeRFEmbedder, typename TLeRF, typename TLeRFRenderer>
+void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, TLeRF, TLeRFRenderer> :: RenderPath(
 	const std::vector <torch::Tensor> &render_poses,
 	int h,
 	int w,
 	float focal,
 	torch::Tensor k,
-	const RenderParams &rparams,
+	const NeRFRenderParams &rparams,
 	std::pair<torch::Tensor, torch::Tensor> rays /*= { torch::Tensor(), torch::Tensor() }*/,			///array of shape[2, batch_size, 3].Ray origin and direction for each example in batch.
 	//torch::Tensor c2w = torch::Tensor(),			///array of shape[3, 4].Camera - to - world transformation matrix.
 	torch::Tensor c2w_staticcam /*= torch::Tensor()*/,			///array of shape[3, 4].If not None, use this transformation matrix for camera while using other c2w argument for viewing directions.
@@ -447,39 +550,37 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: RenderPath(
 
 	for (size_t i = 0; i < render_poses.size(); i++)		//(auto &c2w : render_poses) //
 	{
-		RenderResult render_result = std::move(Render(h, w, k,
-			Model,
-			ExecutorEmbedder,
-			ExecutorEmbeddirs,
-			ModelFine,
-			rparams,
-			rays,
-			render_poses[i].index({ torch::indexing::Slice(torch::indexing::None, 3), torch::indexing::Slice(torch::indexing::None, 4) }),
-			c2w_staticcam
-		));
-		//rgbs.push_back(render_result.Outputs1.RGBMap.cpu());
-		//disps.push_back(render_result.Outputs1.DispMap.cpu());
-		//normalize depth to[0, 1]
-		render_result.Outputs1.DepthMap = (render_result.Outputs1.DepthMap - rparams.Near) / (rparams.Far - rparams.Near);
-
-		//torch::Tensor normals_from_depth = NormalMapFromDepthMap(render_result.Outputs1.DepthMap.detach().cpu());
-		//if (!savedir.empty())
-		//	cv::imwrite((savedir / ("normals_from_depth_" + std::to_string(disps.size() - 1) + ".png")).string(), TorchTensorToCVMat(normals_from_depth));
-
-		if (!savedir.empty())
+		if (Params.use_nerf)
 		{
-			cv::imwrite((savedir / (std::to_string(i) + ".png")).string(), TorchTensorToCVMat(render_result.Outputs1.RGBMap.cpu()));
-			cv::imwrite((savedir / ("disp_" + std::to_string(i) + ".png")).string(), TorchTensorToCVMat(render_result.Outputs1.DispMap));
-			cv::imwrite((savedir / ("depth_" + std::to_string(i) + ".png")).string(), TorchTensorToCVMat(render_result.Outputs1.DepthMap));
-			if (rparams.CalculateNormals)
+			auto render_result = std::move(NeRFRenderer->Render(h, w, k,
+				rparams,
+				rays,
+				render_poses[i].index({ torch::indexing::Slice(torch::indexing::None, 3), torch::indexing::Slice(torch::indexing::None, 4) }),
+				c2w_staticcam
+			));		
+			render_result.Outputs1.DepthMap = (render_result.Outputs1.DepthMap - rparams.Near) / (rparams.Far - rparams.Near);
+
+			//torch::Tensor normals_from_depth = NormalMapFromDepthMap(render_result.Outputs1.DepthMap.detach().cpu());
+			//if (!savedir.empty())
+			//	cv::imwrite((savedir / ("normals_from_depth_" + std::to_string(disps.size() - 1) + ".png")).string(), TorchTensorToCVMat(normals_from_depth));
+
+			if (!savedir.empty())
 			{
-				cv::imwrite((savedir / ("rendered_norm_" + std::to_string(i) + ".png")).string(), TorchTensorToCVMat(render_result.Outputs1.RenderedNormals));
-			}
-			if (rparams.UsePredNormal)
-			{
-				cv::imwrite((savedir / ("pred_rendered_norm_" + std::to_string(i) + ".png")).string(), TorchTensorToCVMat(render_result.Outputs1.RenderedPredNormals));
-			}
-			if (rparams.UseLeRF)
+				cv::imwrite((savedir / (std::to_string(i) + ".png")).string(), TorchTensorToCVMat(render_result.Outputs1.RGBMap.cpu()));
+				cv::imwrite((savedir / ("disp_" + std::to_string(i) + ".png")).string(), TorchTensorToCVMat(render_result.Outputs1.DispMap));
+				cv::imwrite((savedir / ("depth_" + std::to_string(i) + ".png")).string(), TorchTensorToCVMat(render_result.Outputs1.DepthMap));
+			}		//if savedir
+		}		//if use_nerf
+
+		if (Params.use_lerf)
+		{
+			auto render_result = std::move(LeRFRenderer->Render(h, w, k,
+				rparams,
+				rays,
+				render_poses[i].index({ torch::indexing::Slice(torch::indexing::None, 3), torch::indexing::Slice(torch::indexing::None, 4) }),
+				c2w_staticcam
+			));
+			if (!savedir.empty())
 			{
 				//!!!визуализацию similarity с каким-нибудь словом относительно случайного набора (см статью и код)
 				cv::Mat relevancy_img(h, w, CV_8UC1/*CV_32FC1*/);
@@ -492,41 +593,74 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: RenderPath(
 						//image_features = image_features / image_features.norm(2/*L2*/, -1, true);
 				
 						////cosine similarity as logits
-						//auto logits = /*scale * */torch::mm(image_features, text_features.t());
+						//auto logits = /*scale * */torch::mm(image_features, rparams.LerfPositives.t());
 						//float lv = (logits[0,0].item<float>()/*/scale*/ + 1)/2;
-						//test_img.at<uchar>(j, i) = cv::saturate_cast<uchar>(lv/*(lv>0.5?lv:0) */* 255);	//[-1..1] -> [0..255]
+						//relevancy_img.at<uchar>(j, i) = cv::saturate_cast<uchar>(/*(lv>0.5?lv:0)*/lv * 125);	//[-1..1] -> [0..255]
 
 						//relevancy
-						torch::Tensor rel = Relevancy(image_features, rparams.LerfPositives, rparams.LerfNegatives);
+						torch::Tensor rel = Relevancy(image_features, LerfPositives, LerfNegatives);
 						float lv = rel.index({0,0}).item<float>();
-						relevancy_img.at<uchar>(j, i) = cv::saturate_cast<uchar>((lv>0.5?lv:0) * 255);	//[-1..1] -> [0..255]
+						relevancy_img.at<uchar>(j, i) = cv::saturate_cast<uchar>((lv>0.7?lv:0) * 255);	//[-1..1] -> [0..255]
 						//relevancy_img.at<float>(j, i) = /*cv::saturate_cast<uchar>(*/lv/*(lv>0.5?lv:0)*/ /** 255*/;	//[-1..1] -> [0..255]
 					}
 				
 				//cv::normalize(relevancy_img, relevancy_img, 0, 255, cv::NORM_MINMAX);
 				//relevancy_img.convertTo(relevancy_img, CV_8UC1);
 				cv::imwrite((savedir / ("rendered_lang_embedding" + std::to_string(i) + ".png")).string(), relevancy_img);
-			}
-		}
-	}
+			}	//if savedir
+		}	//if use_lerf
+
+		//if (Params.use_nerfactor)
+		//{
+		//	//if (rparams.CalculateNormals)
+		//	{
+		//		cv::imwrite((savedir / ("rendered_norm_" + std::to_string(i) + ".png")).string(), TorchTensorToCVMat(render_result.Outputs1.RenderedNormals));
+		//	}
+		//	//if (rparams.UsePredNormal)
+		//	{
+		//		cv::imwrite((savedir / ("pred_rendered_norm_" + std::to_string(i) + ".png")).string(), TorchTensorToCVMat(render_result.Outputs1.RenderedPredNormals));
+		//	}
+		//}	//if use_nerfactor
+
+	}	//for render_poses
 	//return std::make_pair(rgbs, disps);
 }			//NeRFExecutor :: RenderPath
 
+template <typename TEmbedder, typename TEmbedDirs, typename TNeRF, typename TNeRFRenderer,
+typename TLeRFEmbedder, typename TLeRF, typename TLeRFRenderer>
+void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, TLeRF, TLeRFRenderer> :: SetLeRFPrompts(const std::string &lerf_positives, const std::vector<std::string> &lerf_negatives)
+{
+	std::vector<torch::Tensor> canon_texts_tensors;
+	for (auto &it : lerf_negatives)
+		canon_texts_tensors.push_back(ClipProcessor->EncodeText(it));
+	LerfNegatives = Clip->EncodeText(torch::stack(canon_texts_tensors).to(Device)).to(torch::kCPU); ///[3, 768]
+	//LerfNegatives = LerfNegatives / LerfNegatives.norm(2/*L2*/, -1, true);
+	//output = torch::nn::functional::normalize(output, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8));
+
+	auto input = ClipProcessor->EncodeText(lerf_positives);
+	LerfPositives = Clip->EncodeText(input.unsqueeze(0).to(Device)).to(torch::kCPU);		///[1, 768]
+	//LerfPositives = LerfPositives / LerfPositives.norm(2/*L2*/, -1, true);
+}
+
+template <typename TEmbedder, typename TEmbedDirs, typename TNeRF, typename TNeRFRenderer,
+typename TLeRFEmbedder, typename TLeRF, typename TLeRFRenderer>
+std::tuple<torch::Tensor, torch::Tensor> NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, TLeRF, TLeRFRenderer> :: GetLeRFPrompts()
+{
+	return std::make_tuple(LerfPositives, LerfNegatives);
+}
 
 ///
-template <typename TEmbedder, typename TEmbedDirs, typename TNeRF>
-void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(const CompactData &data, NeRFExecutorTrainParams &params)
+template <typename TEmbedder, typename TEmbedDirs, typename TNeRF, typename TNeRFRenderer,
+typename TLeRFEmbedder, typename TLeRF, typename TLeRFRenderer>
+void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, TLeRF, TLeRFRenderer> :: Train(const CompactData &data, NeRFExecutorTrainParams &params)
 {
-	torch::Tensor LerfPositives,
-		LerfNegatives;
-
 	Initialize(this->Params, data.BoundingBox);
 
 	if (Params.use_lerf)
 	{
 		PyramidEmbedderProperties pyramid_embedder_properties; 
 		pyramid_embedder_properties.ImgSize = {Params.clip_input_img_size, Params.clip_input_img_size};	//Входной размер изображения сети
-		pyramid_embedder_properties.Overlap = 0.5f;										///Доля перекрытия
+		pyramid_embedder_properties.Overlap = Params.pyr_embedder_overlap;										///Доля перекрытия
 		///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0 , 1, 2...
 		pyramid_embedder_properties.MaxZoomOut = std::min(log2f(data.W/Params.clip_input_img_size), log2f(data.H/Params.clip_input_img_size));
 		PyramidEmbedder PyramidClipEmbedder(Clip, ClipProcessor, pyramid_embedder_properties);
@@ -542,56 +676,48 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(const CompactData &dat
 			PyramidClipEmbedding.Load(params.PyramidClipEmbeddingSaveDir/"pyramid_embeddings.pt");
 		}
 
-		std::vector<torch::Tensor> canon_texts_tensors;
-		for (auto &it : Params.lerf_negatives)
-			canon_texts_tensors.push_back(ClipProcessor->EncodeText(it));
-		LerfNegatives = Clip->EncodeText(torch::stack(canon_texts_tensors).to(Device)).to(torch::kCPU); ///[3, 768]
-		//LerfNegatives = LerfNegatives / LerfNegatives.norm(2/*L2*/, -1, true);
-		//output = torch::nn::functional::normalize(output, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8));
-
-		auto input = ClipProcessor->EncodeText(Params.lerf_positives);
-		LerfPositives = Clip->EncodeText(input.unsqueeze(0).to(Device)).to(torch::kCPU);		///[1, 768]
-		//LerfPositives = LerfPositives / LerfPositives.norm(2/*L2*/, -1, true);
+		SetLeRFPrompts(Params.lerf_positives, Params.lerf_negatives);
 	}
 
-	//if (Params.use_lerf) {
-	//	std::cout<<"lang embedding visualization test..."<<std::endl;
-	//	//test
-	//	PyramidEmbedderProperties pyramid_embedder_properties; 
-	//	pyramid_embedder_properties.ImgSize = {Params.clip_input_img_size, Params.clip_input_img_size};	//Входной размер изображения сети
-	//	pyramid_embedder_properties.Overlap = 0.5f;										///Доля перекрытия
-	//	///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0 , 1, 2...
-	//	pyramid_embedder_properties.MaxZoomOut = std::min(log2f(data.W/Params.clip_input_img_size), log2f(data.H/Params.clip_input_img_size));
-	//	//auto scale = Clip->GetLogitScale().exp().to(torch::kCPU);
+	if (Params.use_lerf) 
+	{
+		std::cout<<"lang embedding visualization test..."<<std::endl;
+		//test
+		PyramidEmbedderProperties pyramid_embedder_properties; 
+		pyramid_embedder_properties.ImgSize = {Params.clip_input_img_size, Params.clip_input_img_size};	//Входной размер изображения сети
+		pyramid_embedder_properties.Overlap = Params.pyr_embedder_overlap;										///Доля перекрытия
+		///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0 , 1, 2...
+		pyramid_embedder_properties.MaxZoomOut = std::min(log2f(data.W/Params.clip_input_img_size), log2f(data.H/Params.clip_input_img_size));
+		//auto scale = Clip->GetLogitScale().exp().to(torch::kCPU);
 
-	//	int img_id = 50;
+		int img_id = 50;
 
-	//	//!!!В этом месте можно распараллелить через выполнение батчами на GPU
-	//	//!Объединив несколько cat({image_features1..image_featuresТ})
-	//	cv::Mat test_img(data.H, data.W, CV_8UC1);
-	//	#pragma omp parallel for
-	//	for (int i = 0; i < data.W; i++)
-	//		for (int j = 0; j < data.H; j++)
-	//		{
-	//			torch::Tensor image_features = PyramidClipEmbedding.GetPixelValue(i,j,0.5f,img_id,pyramid_embedder_properties,cv::Size(data.W, data.H)).to(torch::kCPU);
-	//			//Уже нормировано при вычислении пирамиды normalize features???
-	//			//image_features = image_features / image_features.norm(2/*L2*/, -1, true);
-	//			//output = torch::nn::functional::normalize(output, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8));
-	//			
-	//			////cosine similarity as logits
-	//			//auto logits = /*scale * */torch::mm(image_features, LerfPositives.t());
-	//			//float lv = (logits[0,0].item<float>()/*/scale*/ + 1)/2;
-	//			//test_img.at<uchar>(j, i) = cv::saturate_cast<uchar>((lv>0.5?lv:0) * 255);	//[-1..1] -> [0..255]
+		//!!!В этом месте можно распараллелить через выполнение батчами на GPU
+		//!Объединив несколько cat({image_features1..image_featuresТ})
+		cv::Mat test_img(data.H, data.W, CV_8UC1);
+		#pragma omp parallel for
+		for (int i = 0; i < data.W; i++)
+			for (int j = 0; j < data.H; j++)
+			{
+				torch::Tensor image_features = PyramidClipEmbedding.GetPixelValue(i,j,0.5f,img_id,pyramid_embedder_properties,cv::Size(data.W, data.H)).to(torch::kCPU);
+				//Уже нормировано при вычислении пирамиды normalize features???
+				//image_features = image_features / image_features.norm(2/*L2*/, -1, true);
+				//output = torch::nn::functional::normalize(output, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8));
+				
+				////cosine similarity as logits
+				//auto logits = /*scale * */torch::mm(image_features, LerfPositives.t());
+				//float lv = (logits[0,0].item<float>()/*/scale*/ + 1)/2;
+				//test_img.at<uchar>(j, i) = cv::saturate_cast<uchar>(/*(lv>0.5?lv:0)*/lv * 125);	//[-1..1] -> [0..255]
 
-	//			//relevancy
-	//			torch::Tensor rel = Relevancy(image_features, LerfPositives, LerfNegatives);
-	//			float lv = rel.index({0,0}).item<float>();
-	//			test_img.at<uchar>(j, i) = cv::saturate_cast<uchar>((lv>0.5?lv:0) * 255);	//[-1..1] -> [0..255]
-	//		}
-	//	cv::imshow("img", TorchTensorToCVMat(data.Imgs[img_id]));
-	//	cv::imshow("test_img", test_img);
-	//	cv::waitKey(0);
-	//}
+				//relevancy
+				torch::Tensor rel = Relevancy(image_features, LerfPositives, LerfNegatives);
+				float lv = rel.index({0,0}).item<float>();
+				test_img.at<uchar>(j, i) = cv::saturate_cast<uchar>((lv>0.7?lv:0) * 255);	//[-1..1] -> [0..255]
+			}
+		cv::imshow("img", TorchTensorToCVMat(data.Imgs[img_id]));
+		cv::imshow("test_img", test_img);
+		cv::waitKey(1);
+	}
 
 	////NDC only good for LLFF - style forward facing data
 	//if (params.DatasetType != DatasetType::LLFF)
@@ -617,29 +743,8 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(const CompactData &dat
 		if (!std::filesystem::exists(test_save_dir))	std::filesystem::create_directories(test_save_dir);
 		std::cout << "test_poses_shape: " << data.RenderPoses.size() << std::endl;
 
-		//test args: perturb = False, raw_noise_std = 0., calculate_normals = false
-		RenderParams render_params;
-		render_params.NSamples = params.NSamples;
-		render_params.NImportance = NImportance;
-		render_params.Chunk = params.Chunk;
-		render_params.ReturnRaw = params.ReturnRaw;
-		render_params.LinDisp = params.LinDisp;
-		render_params.Perturb = 0.f;
-		//render_params.WhiteBkgr = params.WhiteBkgr;
-		render_params.RawNoiseStd = 0.;
-		render_params.Ndc = params.Ndc;
-		render_params.Near = data.Near;
-		render_params.Far = data.Far;
-		render_params.UseViewdirs = UseViewDirs;
-		render_params.CalculateNormals = false;
-		render_params.UsePredNormal = Params.use_pred_normal;
-		render_params.ReturnWeights = false;
-		render_params.UseLeRF = Params.use_lerf;
-		render_params.LangEmbedDim = Params.lang_embed_dim;
-		render_params.RenderFactor = params.RenderFactor;
-		render_params.LerfPositives = LerfPositives;
-		render_params.LerfNegatives = LerfNegatives;
-		/*auto [rgbs, disps] = */RenderPath(data.RenderPoses, data.H, data.W, data.Focal, data.K, render_params, 
+		std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, false, false));
+		RenderPath(data.RenderPoses, data.H, data.W, data.Focal, data.K, *render_params, 
 			{ torch::Tensor(), torch::Tensor() }, /*c2w_staticcam*/torch::Tensor(), /*data.Imgs,*/ test_save_dir
 		);
 
@@ -764,7 +869,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(const CompactData &dat
 				{
 					PyramidEmbedderProperties pyramid_embedder_properties; 
 					pyramid_embedder_properties.ImgSize = {Params.clip_input_img_size, Params.clip_input_img_size};	//Входной размер изображения сети
-					pyramid_embedder_properties.Overlap = 0.5f;										///Доля перекрытия
+					pyramid_embedder_properties.Overlap = Params.pyr_embedder_overlap;										///Доля перекрытия
 					///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0, 1, 2...
 					pyramid_embedder_properties.MaxZoomOut = std::min(log2f(data.W/Params.clip_input_img_size), log2f(data.H/Params.clip_input_img_size));
 					auto select_coords_cpu = select_coords.to(torch::kCPU).to(torch::kFloat);		//!!!.item<long>()почему то не находит поэтому преобразуем во float
@@ -773,8 +878,8 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(const CompactData &dat
 					for (int idx = 0; idx < select_coords_cpu.size(0)/*NRand*/; idx++)
 					{
 						target_lang_embedding.index_put_({idx/*, torch::indexing::Slice()*/}, PyramidClipEmbedding.GetPixelValue(
-							select_coords_cpu.index({ idx, 0 }).item<float>(),
 							select_coords_cpu.index({ idx, 1 }).item<float>(),
+							select_coords_cpu.index({ idx, 0 }).item<float>(),
 							0.5f,		///!!!ПРИВЯЗАТЬСЯ К МАСШТАБУ для этого перенести в RunNetwork по аналогии с calculated_normals			//Get zoom_out_idx from scale //-1, 0, 1, 2 ... <- 1/2, 1, 2, 4 ...
 							img_i,
 							pyramid_embedder_properties,
@@ -788,119 +893,132 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(const CompactData &dat
 		//Core optimization loop
 		Optimizer->zero_grad();
 		
-		RenderParams render_params;
-		render_params.NSamples = params.NSamples;
-		render_params.NImportance = NImportance;
-		render_params.Chunk = params.Chunk;
-		render_params.ReturnRaw = params.ReturnRaw;
-		render_params.LinDisp = params.LinDisp;
-		render_params.Perturb = 0.f;
-		//render_params.WhiteBkgr = params.WhiteBkgr;
-		render_params.RawNoiseStd = 0.f;
-		render_params.Ndc = params.Ndc;
-		render_params.Near = data.Near;
-		render_params.Far = data.Far;
-		render_params.UseViewdirs = UseViewDirs;
-		render_params.CalculateNormals = Params.calculate_normals || Params.use_pred_normal;
-		render_params.UsePredNormal = Params.use_pred_normal;
-		render_params.ReturnWeights = true;
-		render_params.UseLeRF = Params.use_lerf;
-		render_params.LangEmbedDim = Params.lang_embed_dim;
-		render_params.RenderFactor = 0;
-		render_params.LerfPositives = LerfPositives;
-		render_params.LerfNegatives = LerfNegatives;
+		torch::Tensor loss = torch::full({ 1/*img_loss.sizes()*/ }, 0.f).to(Device),
+			psnr = torch::full({ 1/*img_loss.sizes()*/ }, 10.f).to(Device);
 
-		RenderResult rgb_disp_acc_extras = std::move(Render(data.H, data.W, data.K,
-			Model, ExecutorEmbedder, ExecutorEmbeddirs, ModelFine,
-			render_params, batch_rays, torch::Tensor(), torch::Tensor()				/*либо rays либо pose c2w*/
-		));
-
-		auto mse_loss = torch::mse_loss(rgb_disp_acc_extras.Outputs1.RGBMap, target_s.detach());
-		auto img_loss = torch::nn::functional::huber_loss(
-					rgb_disp_acc_extras.Outputs1.RGBMap,
-					target_s.detach()
-			);
-		if (params.ReturnRaw)
-			auto trans = rgb_disp_acc_extras.Raw.index({ "...", -1 });		//последний элемент последнего измерения тензора
-		auto loss = img_loss;
-		auto psnr = -10. * torch::log(mse_loss) / torch::log(torch::full({ 1/*img_loss.sizes()*/ }, /*value=*/10.f)).to(Device);
-
-		torch::Tensor img_loss0,
-			psnr0;
-		if (rgb_disp_acc_extras.Outputs0.RGBMap.defined() && (rgb_disp_acc_extras.Outputs0.RGBMap.numel() != 0))
+		if (Params.use_nerf)
 		{
-			auto mse_loss0 = torch::mse_loss(rgb_disp_acc_extras.Outputs0.RGBMap, target_s.detach());
-			img_loss0 = torch::nn::functional::huber_loss(
-					rgb_disp_acc_extras.Outputs0.RGBMap,
-					target_s.detach()
+			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, true, Params.calculate_normals || Params.use_pred_normal));
+			auto rgb_disp_acc_extras = std::move(NeRFRenderer->Render(data.H, data.W, data.K,
+				*render_params, batch_rays, torch::Tensor(), torch::Tensor()				/*либо rays либо pose c2w*/
+			));
+			torch::Tensor mse_loss;
+			torch::Tensor img_loss;
+		
+			mse_loss = torch::mse_loss(rgb_disp_acc_extras.Outputs1.RGBMap, target_s.detach());
+			img_loss = torch::nn::functional::huber_loss(
+						rgb_disp_acc_extras.Outputs1.RGBMap,
+						target_s.detach()
 				);
-			loss = loss + img_loss0;
-			psnr0 = -10. * torch::log(mse_loss0) / torch::log(torch::full({ 1/*img_loss.sizes()*/ }, /*value=*/10.f)).to(Device);
-		}
+			if (params.ReturnRaw)
+				auto trans = rgb_disp_acc_extras.Raw.index({ "...", -1 });		//последний элемент последнего измерения тензора
 
-		//add Total Variation loss
-		if constexpr (std::is_same_v<TEmbedder, HashEmbedder>)
-			if (i < n_iters/2)
+			loss = img_loss;
+			psnr = -10. * torch::log(mse_loss) / torch::log(torch::full({ 1/*img_loss.sizes()*/ }, /*value=*/10.f)).to(Device);
+
+			torch::Tensor img_loss0,
+				psnr0;
+		
+			if (rgb_disp_acc_extras.Outputs0.RGBMap.defined() && (rgb_disp_acc_extras.Outputs0.RGBMap.numel() != 0))
 			{
-				const float tv_loss_weight = 1e-6;
-				for (int level = 0; level < ExecutorEmbedder->GetNLevels(); level++)
-				{
-					loss = loss + tv_loss_weight * TotalVariationLoss(
-						ExecutorEmbedder,
-						Device,
-						ExecutorEmbedder->GetBaseResolution(),
-						ExecutorEmbedder->GetFinestResolution(),
-						level,
-						ExecutorEmbedder->GetLog2HashmapSize(),
-						ExecutorEmbedder->GetNLevels()
-					).to(loss.device());
-				}
+				auto mse_loss0 = torch::mse_loss(rgb_disp_acc_extras.Outputs0.RGBMap, target_s.detach());
+				img_loss0 = torch::nn::functional::huber_loss(
+						rgb_disp_acc_extras.Outputs0.RGBMap,
+						target_s.detach()
+					);
+				loss = loss + img_loss0;
+				psnr0 = -10. * torch::log(mse_loss0) / torch::log(torch::full({ 1/*img_loss.sizes()*/ }, /*value=*/10.f)).to(Device);
 			}
 
-		////add Total Variation loss
-		//if constexpr (std::is_same_v<TEmbedder, CuHashEmbedder>)
-		//	if (i < n_iters/2)
-		//	{
-		//		const float tv_loss_weight = 1e-6;
-		//		loss += tv_loss_weight * TotalVariationLoss(ExecutorEmbedder).to(loss.device());
-		//	}
+			//add Total Variation loss
+			if constexpr (std::is_same_v<TEmbedder, HashEmbedder>)
+				if (i < n_iters/2)
+				{
+					const float tv_loss_weight = 1e-6;
+					for (int level = 0; level < ExecutorEmbedder->GetNLevels(); level++)
+					{
+						loss = loss + tv_loss_weight * TotalVariationLoss(
+							ExecutorEmbedder,
+							Device,
+							ExecutorEmbedder->GetBaseResolution(),
+							ExecutorEmbedder->GetFinestResolution(),
+							level,
+							ExecutorEmbedder->GetLog2HashmapSize(),
+							ExecutorEmbedder->GetNLevels()
+						).to(loss.device());
+					}
+				}
 
-		if (rgb_disp_acc_extras.Outputs1.Normals.defined() && rgb_disp_acc_extras.Outputs1.Normals.numel() != 0)
-		{
-			const float orientation_loss_weight = 1.f;//1e-4;
-			//Loss that encourages that all visible normals are facing towards the camera.
-			auto orientation_loss = OrientationLoss(rgb_disp_acc_extras.Outputs1.Weights.unsqueeze(-1).detach(), rgb_disp_acc_extras.Outputs1.Normals, batch_rays.second/*directions*/);
-			loss = loss + torch::mean(orientation_loss) * orientation_loss_weight;
-		}
+			////add Total Variation loss
+			//if constexpr (std::is_same_v<TEmbedder, CuHashEmbedder>)
+			//	if (i < n_iters/2)
+			//	{
+			//		const float tv_loss_weight = 1e-6;
+			//		loss += tv_loss_weight * TotalVariationLoss(ExecutorEmbedder).to(loss.device());
+			//	}
 
-		//
-		if (Params.use_pred_normal)
+			loss.backward();
+		}		//if use_nerf
+
+		//if (Params.use_nerfactor)
+		if constexpr (std::is_same_v<TNeRF, NeRFactor>)
 		{
-			const float pred_normal_loss_weight = 1.f;//1e-3;
-			//Loss between normals calculated from density and normals from prediction network.
-			auto pred_normal_loss = PredNormalLoss(
-				rgb_disp_acc_extras.Outputs1.Weights.unsqueeze(-1).detach(),
-				rgb_disp_acc_extras.Outputs1.Normals.detach(),	//Градиент не течет сюда потому что хотим оптимизировать предсказанные нормали за счет вычисленных
-				rgb_disp_acc_extras.Outputs1.PredNormals
-			);
-			loss = loss + torch::mean(pred_normal_loss) * pred_normal_loss_weight;
-		}
+			//std::unique_ptr<NeRFactorRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, true, Params.calculate_normals || Params.use_pred_normal));
+			//auto nerfactor_render_result = std::move(NeRFactorRenderer->Render(data.H, data.W, data.K,
+			//	*render_params, batch_rays, torch::Tensor(), torch::Tensor()				/*либо rays либо pose c2w*/
+			//));
+			//if (nerfactor_render_result.Outputs1.Normals.defined() && nerfactor_render_result.Outputs1.Normals.numel() != 0)
+			//{
+			//	const float orientation_loss_weight = 1.f;//1e-4;
+			//	//Loss that encourages that all visible normals are facing towards the camera.
+			//	auto orientation_loss = OrientationLoss(nerfactor_render_result.Outputs1.Weights.unsqueeze(-1).detach(), nerfactor_render_result.Outputs1.Normals, batch_rays.second/*directions*/);
+			//	loss = loss + torch::mean(orientation_loss) * orientation_loss_weight;
+			//}
+
+			////
+			//if (Params.use_pred_normal)
+			//{
+			//	const float pred_normal_loss_weight = 1.f;//1e-3;
+			//	//Loss between normals calculated from density and normals from prediction network.
+			//	auto pred_normal_loss = PredNormalLoss(
+			//		nerfactor_render_result.Outputs1.Weights.unsqueeze(-1).detach(),
+			//		nerfactor_render_result.Outputs1.Normals.detach(),	//Градиент не течет сюда потому что хотим оптимизировать предсказанные нормали за счет вычисленных
+			//		nerfactor_render_result.Outputs1.PredNormals
+			//	);
+			//	loss = loss + torch::mean(pred_normal_loss) * pred_normal_loss_weight;
+			//}
+		}		//if use_nerfactor
 
 		torch::Tensor lang_loss;
 		const float lang_loss_weight = 1e-1f;//1e-2f;
 		if (Params.use_lerf)
 		{
+			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, true, Params.calculate_normals || Params.use_pred_normal));
+			auto lerf_render_result = std::move(LeRFRenderer->Render(data.H, data.W, data.K,
+				*render_params, batch_rays, torch::Tensor(), torch::Tensor()				/*либо rays либо pose c2w*/
+			));
+			//lang_loss = torch::nn::functional::cosine_embedding_loss(
+			//	rgb_disp_acc_extras.Outputs1.RenderedLangEmbedding.to(loss.device()),
+			//	target_lang_embedding.detach().to(loss.device()),//target clip embeddings provided by PyramidEmbedder for a given set of pixels
+			//	torch::ones({rgb_disp_acc_extras.Outputs1.RenderedLangEmbedding.sizes()[0]})
+			//);
 			lang_loss = torch::nn::functional::huber_loss(
-					rgb_disp_acc_extras.Outputs1.RenderedLangEmbedding.to(loss.device()),
+					lerf_render_result.Outputs1.RenderedLangEmbedding.to(loss.device()),
 					target_lang_embedding.detach().to(loss.device()),	//target clip embeddings provided by PyramidEmbedder for a given set of pixels
 					torch::nn::functional::HuberLossFuncOptions().reduction(torch::kNone).delta(1.25)
 				).sum(-1).nanmean();
+			//lang_loss = torch::nn::functional::huber_loss(
+			//	rgb_disp_acc_extras.Outputs1.RenderedLangEmbedding.to(loss.device()),
+			//	target_lang_embedding.detach().to(loss.device())	//target clip embeddings provided by PyramidEmbedder for a given set of pixels
+			//);
+			//lang_loss = - torch::mm(rgb_disp_acc_extras.Outputs1.RenderedLangEmbedding.to(loss.device()), target_lang_embedding.detach().to(loss.device()).t()).nanmean();
 			//auto lang_loss = torch::mse_loss(rgb_disp_acc_extras.Outputs1.RenderedLangEmbedding.to(loss.device()), target_lang_embedding.to(loss.device()));
-				loss = loss + lang_loss * lang_loss_weight;		
-		}
+			//loss = loss + lang_loss * lang_loss_weight;
+			std::cout<<"lang_loss: " << lang_loss << std::endl;
+			lang_loss.backward();
+		}		//if use_lerf
 
 		try {
-			loss.backward();
 			Optimizer->step();
 		} catch (c10::Error &error){
 			std::cout<<error.msg()<<" "<<error.what()<<std::endl;
@@ -919,12 +1037,23 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(const CompactData &dat
 		{
 			auto path = params.BaseDir; /* / (std::to_string(i) + ".tar") */;
 			if (!std::filesystem::exists(path))	std::filesystem::create_directories(path);
-			torch::save(ExecutorEmbedder, (path / "embedder_checkpoint.pt").string());
+			if (Params.use_nerf)
+			{
+				torch::save(ExecutorEmbedder, (path / "embedder_checkpoint.pt").string());
+				torch::save(Model, (path / "model_checkpoint.pt").string());
+				if (!ModelFine.is_empty())
+					torch::save(ModelFine, (path / "model_fine_checkpoint.pt").string());
+			}
+			if (Params.use_lerf)
+			{
+				torch::save(LangEmbedder, (path / "lang_embedder_checkpoint.pt").string());
+				torch::save(LangModel, (path / "lang_model_checkpoint.pt").string());
+				if (!LangModelFine.is_empty())
+					torch::save(LangModelFine, (path / "lang_model_fine_checkpoint.pt").string());
+			}
 			torch::save(torch::full({ 1 }, /*value=*/global_step), (path / "start_checkpoint.pt").string());
 			torch::save(*Optimizer.get(), (path / "optimizer_checkpoint.pt").string());
-			torch::save(Model, (path / "model_checkpoint.pt").string());
-			if (!ModelFine.is_empty())
-				torch::save(ModelFine, (path / "model_fine_checkpoint.pt").string());
+
 			std::cout << "Saved checkpoints at " << path.string() << std::endl;
 		}
 
@@ -951,28 +1080,9 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(const CompactData &dat
 					test_poses.push_back(data.Poses[k].to(Device));
 				}
 			}
-			RenderParams render_params;
-			render_params.NSamples = params.NSamples;
-			render_params.NImportance = NImportance;
-			render_params.Chunk = params.Chunk;
-			render_params.ReturnRaw = params.ReturnRaw;
-			render_params.LinDisp = params.LinDisp;
-			render_params.Perturb = 0.f;
-			//render_params.WhiteBkgr = params.WhiteBkgr;
-			render_params.RawNoiseStd = 0.f;
-			render_params.Ndc = params.Ndc;
-			render_params.Near = data.Near;
-			render_params.Far = data.Far;
-			render_params.UseViewdirs = UseViewDirs;
-			render_params.CalculateNormals = false;
-			render_params.UsePredNormal = Params.use_pred_normal;
-			render_params.ReturnWeights = false;
-			render_params.UseLeRF = Params.use_lerf;
-			render_params.LangEmbedDim = Params.lang_embed_dim;
-			render_params.RenderFactor = 0;
-			render_params.LerfPositives = LerfPositives;
-			render_params.LerfNegatives = LerfNegatives;
-			RenderPath(test_poses/*poses[i_test]).to(device)*/, data.H, data.W, data.Focal, data.K, render_params,
+
+			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, false, false));
+			RenderPath(test_poses/*poses[i_test]).to(device)*/, data.H, data.W, data.Focal, data.K, *render_params,
 				{ torch::Tensor(), torch::Tensor() }, /*c2w_staticcam*/torch::Tensor(), /*test_imgs,*/ test_save_dir
 			);
 			std::cout << "Saved test set" << std::endl;
@@ -983,29 +1093,8 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF> :: Train(const CompactData &dat
 			torch::NoGradGuard no_grad;
 			auto dir = params.BaseDir / "render";
 			if (!std::filesystem::exists(dir))	std::filesystem::create_directories(dir);
-			//test args: perturb = False, raw_noise_std = 0.
-			RenderParams render_params;
-			render_params.NSamples = params.NSamples;
-			render_params.NImportance = NImportance;
-			render_params.Chunk = params.Chunk;
-			render_params.ReturnRaw = params.ReturnRaw;
-			render_params.LinDisp = params.LinDisp;
-			render_params.Perturb = 0.f;
-			//render_params.WhiteBkgr = params.WhiteBkgr;
-			render_params.RawNoiseStd = 0.f;
-			render_params.Ndc = params.Ndc;
-			render_params.Near = data.Near;
-			render_params.Far = data.Far;
-			render_params.UseViewdirs = UseViewDirs;
-			render_params.CalculateNormals = false;
-			render_params.UsePredNormal = Params.use_pred_normal;
-			render_params.ReturnWeights = false;
-			render_params.UseLeRF = Params.use_lerf;
-			render_params.LangEmbedDim = Params.lang_embed_dim;
-			render_params.RenderFactor = 0;
-			render_params.LerfPositives = LerfPositives;
-			render_params.LerfNegatives = LerfNegatives;
-			RenderPath(data.RenderPoses, data.H, data.W, data.Focal, data.K, render_params, { torch::Tensor(), torch::Tensor() },
+			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, false, false));
+			RenderPath(data.RenderPoses, data.H, data.W, data.Focal, data.K, *render_params, { torch::Tensor(), torch::Tensor() },
 				/*c2w_staticcam*/torch::Tensor(),/*, data.Imgs,*/  dir/*, params.RenderFactor*/
 			);
 			std::cout << "Done, saving " << std::endl;

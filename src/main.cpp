@@ -4,9 +4,10 @@
 #include "CuSHEncoder.h"
 #include "CuHashEmbedder.h"
 #include "NeRF.h"
-#include "LeRF.h"
-#include "BaseNeRFRenderer.h"
+#include "NeRFRenderer.h"
 #include "NeRFExecutor.h"
+#include "LeRF.h"
+#include "LeRFRenderer.h"
 
 #include <cmath>
 #include <cstdio>
@@ -178,10 +179,11 @@ int main(int argc, const char* argv[])
 	exparams.net_depth = 2;				//layers in network 8 for classic NeRF, 2/3 for HashNeRF
 	exparams.net_width = 64;				//channels per layer 256 for classic NeRF, 64 for HashNeRF
 	exparams.multires = 10;
+	exparams.use_nerf = true;
 	exparams.use_viewdirs = true;	//use full 5D input instead of 3D Не всегда нужна зависимость от направления обзора + обучение быстрее процентов на 30.
 	exparams.calculate_normals = false;
 	exparams.use_pred_normal = false;	//whether to use predicted normals
-	exparams.use_lerf = false;				//use language embedded radiance fields
+	exparams.use_lerf = true;				//use language embedded radiance fields
 	exparams.multires_views = 7;		//log2 of max freq for positional encoding (2D direction)
 	exparams.n_importance = 192;//192;		//number of additional fine samples per ray
 	exparams.net_depth_fine = 2;		//layers in fine network 8 for classic NeRF, 2/3 for HashNeRF
@@ -203,19 +205,22 @@ int main(int argc, const char* argv[])
 	exparams.ft_path = "output";
 	exparams.n_levels_le = exparams.n_levels/*32*/,																		//for language embedder
 	exparams.n_features_per_level_le = 8/*8*/,								//for language embedder
-	exparams.log2_hashmap_size_le = 21,									//for language embedder
+	exparams.log2_hashmap_size_le = 19,									//for language embedder
 	exparams.base_resolution_le = exparams.base_resolution,													//for language embedder
 	exparams.finest_resolution_le = exparams.finest_resolution,										//for language embedder
+	exparams.pyr_embedder_overlap = 0.75f;
 	exparams.clip_input_img_size = 336;	//Input RuClip model size
 	exparams.num_layers_le = 2;					//Language embedder head params
 	exparams.hidden_dim_le = 256;				//Language embedder head params
 	exparams.lang_embed_dim = 768;			//Language embedder head params
+	exparams.geo_feat_dim_le = 32;			//Language embedder head params
 	exparams.path_to_clip = "..//..//RuCLIP//data//ruclip-vit-large-patch14-336";									//Path to RuClip model
 	exparams.path_to_bpe = "..//..//RuCLIP//data//ruclip-vit-large-patch14-336//bpe.model";			//Path to tokenizer
-	exparams.lerf_positives = "тарелки";
-	exparams.lerf_negatives = {"объект", "вещи", "текстура"};
-	//NeRFExecutor <LeRFEmbedder<CuHashEmbedder>, CuSHEncoder, LeRF> nerf_executor(exparams);
-	NeRFExecutor <CuHashEmbedder, CuSHEncoder, NeRFSmall> nerf_executor(exparams);
+	exparams.lerf_positives = "металлическая тарелка";//"металлическая тарелка";//"красный барабан";
+	exparams.lerf_negatives = {"объект", "предметы", "текстура"};
+	NeRFExecutor <CuHashEmbedder, CuSHEncoder, NeRFSmall, NeRFRenderer<CuHashEmbedder, CuSHEncoder, NeRFSmall>,
+		CuHashEmbedder/*LeRFEmbedder<CuHashEmbedder>*/, LeRF, LeRFRenderer> nerf_executor(exparams);
+	//NeRFExecutor <CuHashEmbedder, CuSHEncoder, NeRFSmall, NeRFRenderer<CuHashEmbedder, CuSHEncoder, NeRFSmall>> nerf_executor(exparams);
 
 	NeRFExecutorTrainParams params;
 	params.BaseDir = "output";			//where to store ckpts and logs
@@ -224,24 +229,26 @@ int main(int argc, const char* argv[])
 	params.LinDisp = false;					//sampling linearly in disparity rather than depth
 	params.NoBatching = true;				//only take random rays from 1 image at a time
 	params.TestSkip = false;
-	params.Chunk = 1024 * 4;				//number of rays processed in parallel, decrease if running out of memory
+	params.Chunk = 1024;				//number of rays processed in parallel, decrease if running out of memory
 	params.NSamples = 64;						//number of coarse samples per ray
 	params.NRand = 32 * 32 * 1;			//batch size (number of random rays per gradient step), decrease if running out of memory
 	params.PrecorpIters = 0;				//number of steps to train on central crops
-	params.NIters = 20100;
-	params.LRateDecay = 10;				//exponential learning rate decay (in 1000 steps)  например: 150 - каждые 150000 итераций скорость обучения будет падать в 10 раз
+	params.NIters = 6100;
+	params.LRateDecay = 2;				//exponential learning rate decay (in 1000 steps)  например: 150 - каждые 150000 итераций скорость обучения будет падать в 10 раз
 	//logging / saving options
 	params.IPrint = 100;						//frequency of console printout and metric loggin
 	params.IImg = 500;							//frequency of tensorboard image logging
-	params.IWeights = 20000;				//frequency of weight ckpt saving
-	params.ITestset = 20000;				//frequency of testset saving
-	params.IVideo = 20200;					//frequency of render_poses video saving
+	params.IWeights = 6000;				//frequency of weight ckpt saving
+	params.ITestset = 6000;				//frequency of testset saving
+	params.IVideo = 6200;					//frequency of render_poses video saving
 	params.ReturnRaw = false;
 	params.RenderFactor = 0;
 	params.PrecorpFrac = 0.5f;
 	params.PyramidClipEmbeddingSaveDir = DATA_DIR;			//
 
-	CompactData data = nerf_executor.LoadData(DATA_DIR, DatasetType::BLENDER, 
+	CompactData data = LoadData(DATA_DIR,
+		exparams.device,
+		DatasetType::BLENDER, 
 		false,			///load blender synthetic data at 400x400 instead of 800x800
 		params.TestSkip,
 		false				///set to render synthetic data on a white bkgd (always use for dvoxels)

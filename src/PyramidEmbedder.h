@@ -21,7 +21,7 @@
 struct PyramidEmbedderProperties 
 {
 	cv::Size ImgSize {0, 0};	//Входной размер изображения сети
-	float Overlap {0.5};			///Доля перекрытия
+	float Overlap {0.75};			///Доля перекрытия
 	int MaxZoomOut{1};				///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0 , 1, 2...
 };
 
@@ -56,7 +56,8 @@ protected:
 		const int data_img_id,
 		const float x1, const float x2, const float y1, const float y2,
 		const float x,
-		const float y
+		const float y,
+		const cv::Size &img_size
 	);	
 public:
 	///{hor_pos_idx, vert_pos_idx, zoom_out_idx, data_img_id}, {features}

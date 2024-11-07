@@ -21,7 +21,7 @@ set(SOURCES ${SOURCES}
 	src/CuHashEmbedder.cpp
 	src/CuHashEmbedder.cu
 	src/NeRF.cpp
-	src/BaseNeRFRenderer.cpp
+	src/NeRFRenderer.cpp
 	src/NeRFExecutor.cpp
 	../RuCLIP/src/RuCLIP.cpp
 	../RuCLIP/src/RuCLIPProcessor.cpp
@@ -30,6 +30,7 @@ set(SOURCES ${SOURCES}
 	../RuCLIP/src/youtokentome/bpe.cpp	
 	src/PyramidEmbedder.cpp
 	src/LeRF.cpp
+	src/LeRFRenderer.cpp
 	src/main.cpp
 )
 
@@ -43,7 +44,7 @@ set(HEADERS ${HEADERS}
 	src/CuSHEncoder.h
 	src/CuHashEmbedder.h
 	src/NeRF.h
-	src/BaseNeRFRenderer.h
+	src/NeRFRenderer.h
 	src/NeRFExecutor.h
 	src/Common/TRandomInt.h
 	src/RayUtils.h
@@ -54,6 +55,7 @@ set(HEADERS ${HEADERS}
 	../RuCLIP/src/RuCLIPProcessor.h
 	src/PyramidEmbedder.h
 	src/LeRF.h
+	src/LeRFRenderer.h
 )
 
 set(LIBS ${LIBS}
