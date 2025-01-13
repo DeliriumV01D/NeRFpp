@@ -229,7 +229,7 @@ int main(int argc, const char* argv[])
 	params.LinDisp = false;					//sampling linearly in disparity rather than depth
 	params.NoBatching = true;				//only take random rays from 1 image at a time
 	params.TestSkip = false;
-	params.Chunk = 1024;				//number of rays processed in parallel, decrease if running out of memory
+	params.Chunk = 1024 * 4;				//number of rays processed in parallel, decrease if running out of memory
 	params.NSamples = 64;						//number of coarse samples per ray
 	params.NRand = 32 * 32 * 1;			//batch size (number of random rays per gradient step), decrease if running out of memory
 	params.PrecorpIters = 0;				//number of steps to train on central crops
@@ -260,5 +260,10 @@ int main(int argc, const char* argv[])
 	data.K = torch::from_blob(kdata, { 3, 3 }, torch::kFloat32);
 	//data.K = GetCalibrationMatrix(data.Focal, data.W, data.H).clone().detach();
 	data.BoundingBox = GetBbox3dForObj(data).clone().detach();
+
 	nerf_executor.Train(data, params);
+
+	exparams.SaveToFile(params.BaseDir / "executor_params.json");
+	params.SaveToFile(params.BaseDir / "executor_train_params.json");
+	data.SaveToFile(params.BaseDir / "data.json");
 }

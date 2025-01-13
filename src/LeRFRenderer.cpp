@@ -1,4 +1,5 @@
 #include "LeRFRenderer.h"
+#include "RuCLIPProcessor.h"	//Relevancy
 
 ///Prepares inputs and applies network lerf or lerf_fine.
 torch::Tensor LeRFRenderer :: RunLENetwork(torch::Tensor inputs, LeRF lerf, CuHashEmbedder lang_embed_fn)
@@ -59,6 +60,8 @@ LeRFRendererOutputs LeRFRenderer :: RawToLEOutputs(
 	result.RenderedLangEmbedding = RenderCLIPEmbedding(result.LangEmbedding, result.WeightsLE.unsqueeze(-1));
 	//result.RenderedLangEmbedding = RenderCLIPEmbedding(result.LangEmbedding, result.Weights.unsqueeze(-1).detach());
 	//result.RenderedLanguageEmbedding = CLIPEmbeddingShader(result.RenderedLanguageEmbedding);
+
+	result.Relevancy = Relevancy(result.RenderedLangEmbedding, LerfPositives.to(device), LerfNegatives.to(device));
 
 	return result;
 }
@@ -144,6 +147,8 @@ LeRFRenderResult LeRFRenderer :: RenderRays(
 		lerf_result.Outputs1.WeightsLE = torch::Tensor();
 		lerf_result.Outputs0.LangEmbedding = torch::Tensor();
 		lerf_result.Outputs1.LangEmbedding = torch::Tensor();
+		lerf_result.Outputs0.RenderedLangEmbedding = torch::Tensor();
+		lerf_result.Outputs1.RenderedLangEmbedding = torch::Tensor();
 	}
 	return lerf_result;
 }
@@ -188,12 +193,14 @@ LeRFRenderResult LeRFRenderer :: BatchifyRays(
 		out_depth_map_le,
 		out_lang_embedding,
 		out_rendered_lang_embedding,
+		out_relevancy,
 		out0_disp_map_le,
 		out0_acc_map_le,
 		out0_weights_le,
 		out0_depth_map_le,
 		out0_lang_embedding,
 		out0_rendered_lang_embedding,
+		out0_relevancy,
 		raw;
 	for (auto it : all_results)
 	{
@@ -203,12 +210,14 @@ LeRFRenderResult LeRFRenderer :: BatchifyRays(
 		if (it.Outputs1.DepthMapLE.defined()) out_depth_map_le.push_back(it.Outputs1.DepthMapLE);
 		if (it.Outputs1.LangEmbedding.defined()) out_lang_embedding.push_back(it.Outputs1.LangEmbedding);
 		if (it.Outputs1.RenderedLangEmbedding.defined()) out_rendered_lang_embedding.push_back(it.Outputs1.RenderedLangEmbedding);
+		if (it.Outputs1.Relevancy.defined()) out_relevancy.push_back(it.Outputs1.Relevancy);
 		if (it.Outputs0.DispMapLE.defined()) out0_disp_map_le.push_back(it.Outputs0.DispMapLE);
 		if (it.Outputs0.AccMapLE.defined()) out0_acc_map_le.push_back(it.Outputs0.AccMapLE);
 		if (it.Outputs0.WeightsLE.defined()) out0_weights_le.push_back(it.Outputs0.WeightsLE);
 		if (it.Outputs0.DepthMapLE.defined()) out0_depth_map_le.push_back(it.Outputs0.DepthMapLE);
 		if (it.Outputs0.LangEmbedding.defined()) out0_lang_embedding.push_back(it.Outputs0.LangEmbedding);
 		if (it.Outputs0.RenderedLangEmbedding.defined()) out0_rendered_lang_embedding.push_back(it.Outputs0.RenderedLangEmbedding);
+		if (it.Outputs0.Relevancy.defined()) out0_relevancy.push_back(it.Outputs0.Relevancy);
 		if (it.Raw.defined()) raw.push_back(it.Raw);
 	}
 	if (!out_disp_map_le.empty()) result.Outputs1.DispMapLE = torch::cat(out_disp_map_le, 0);
@@ -217,12 +226,14 @@ LeRFRenderResult LeRFRenderer :: BatchifyRays(
 	if (!out_depth_map_le.empty()) result.Outputs1.DepthMapLE = torch::cat(out_depth_map_le, 0);
 	if (!out_lang_embedding.empty()) result.Outputs1.LangEmbedding = torch::cat(out_lang_embedding, 0);
 	if (!out_rendered_lang_embedding.empty()) result.Outputs1.RenderedLangEmbedding = torch::cat(out_rendered_lang_embedding, 0);
+	if (!out_relevancy.empty()) result.Outputs1.Relevancy = torch::cat(out_relevancy, 0);
 	if (!out0_disp_map_le.empty()) result.Outputs0.DispMapLE = torch::cat(out0_disp_map_le, 0);
 	if (!out0_acc_map_le.empty()) result.Outputs0.AccMapLE = torch::cat(out0_acc_map_le, 0);
 	if (!out0_weights_le.empty()) result.Outputs0.WeightsLE = torch::cat(out0_weights_le, 0);
 	if (!out0_depth_map_le.empty()) result.Outputs0.DepthMapLE = torch::cat(out0_depth_map_le, 0);
 	if (!out0_lang_embedding.empty()) result.Outputs0.LangEmbedding = torch::cat(out0_lang_embedding, 0);
 	if (!out0_rendered_lang_embedding.empty()) result.Outputs0.RenderedLangEmbedding = torch::cat(out0_rendered_lang_embedding, 0);
+	if (!out0_relevancy.empty()) result.Outputs0.Relevancy = torch::cat(out0_relevancy, 0);
 	if (!raw.empty()) result.Raw = torch::cat(raw, 0);
 
 	return result;
@@ -285,11 +296,21 @@ LeRFRenderResult LeRFRenderer :: Render(
 			all_ret.Outputs1.RenderedLangEmbedding = torch::reshape(all_ret.Outputs1.RenderedLangEmbedding, { sh[0], sh[1], Lerf->GetLangEmbedDim() });
 		if (all_ret.Outputs0.RenderedLangEmbedding.numel() != 0)
 			all_ret.Outputs0.RenderedLangEmbedding = torch::reshape(all_ret.Outputs0.RenderedLangEmbedding, { sh[0], sh[1], Lerf->GetLangEmbedDim() });
+
+		if (all_ret.Outputs1.Relevancy.numel() != 0)
+			all_ret.Outputs1.Relevancy = torch::reshape(all_ret.Outputs1.Relevancy, { sh[0], sh[1], 2 });
+		if (all_ret.Outputs0.Relevancy.numel() != 0)
+			all_ret.Outputs0.Relevancy = torch::reshape(all_ret.Outputs0.Relevancy, { sh[0], sh[1], 2 });
 	} else {
 		if (all_ret.Outputs1.RenderedLangEmbedding.numel() != 0)
 			all_ret.Outputs1.RenderedLangEmbedding = torch::reshape(all_ret.Outputs1.RenderedLangEmbedding, { sh[0], Lerf->GetLangEmbedDim() });
 		if (all_ret.Outputs0.RenderedLangEmbedding.numel() != 0)
 			all_ret.Outputs0.RenderedLangEmbedding = torch::reshape(all_ret.Outputs0.RenderedLangEmbedding, { sh[0], Lerf->GetLangEmbedDim() });
+
+		if (all_ret.Outputs1.Relevancy.numel() != 0)
+			all_ret.Outputs1.Relevancy = torch::reshape(all_ret.Outputs1.Relevancy, { sh[0], 2 });
+		if (all_ret.Outputs0.Relevancy.numel() != 0)
+			all_ret.Outputs0.Relevancy = torch::reshape(all_ret.Outputs0.Relevancy, { sh[0], 2 });
 	}
 
 	return all_ret;

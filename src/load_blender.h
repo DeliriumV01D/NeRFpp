@@ -85,7 +85,97 @@ struct CompactData {
 	std::vector<torch::Tensor> Imgs,
 		Poses,
 		RenderPoses;
-};
+
+	nlohmann::json ToJson() const 
+	{
+		nlohmann::json j;
+		j["H"] = H;
+		j["W"] = W;
+		j["Focal"] = Focal;
+		j["Near"] = Near;
+		j["Far"] = Far;
+		j["SplitsIdx"] = SplitsIdx;
+		j["Splits"] = Splits;
+
+		//Serialize torch::Tensor K
+		j["K"] = std::vector<float>(K.data_ptr<float>(), K.data_ptr<float>() + K.numel());
+
+		//Serialize torch::Tensor BoundingBox
+		j["BoundingBox"] = std::vector<float>(BoundingBox.data_ptr<float>(), BoundingBox.data_ptr<float>() + BoundingBox.numel());
+
+		//Serialize cv::Mat d
+		j["d"] = std::vector<double>(d.ptr<double>(), d.ptr<double>() + d.total());
+
+		//Serialize tensors in vectors
+		auto serialize_tensors = [](const std::vector<torch::Tensor> &tensors)
+		{
+			std::vector<std::vector<float>> serialized;
+			for (/*const */auto &tensor : tensors)
+			{
+				serialized.push_back(std::vector<float>(tensor.data_ptr<float>(), tensor.data_ptr<float>() + tensor.numel()));
+			}
+			return serialized;
+		};
+
+		//j["Imgs"] = serialize_tensors(Imgs);
+		j["Poses"] = serialize_tensors(Poses);
+		//j["RenderPoses"] = serialize_tensors(RenderPoses);
+
+		return j;
+	}		//CompactData::ToJson
+
+	void FromJson(const nlohmann::json &j)
+	{
+		j.at("H").get_to(H);
+		j.at("W").get_to(W);
+		j.at("Focal").get_to(Focal);
+		j.at("Near").get_to(Near);
+		j.at("Far").get_to(Far);
+		j.at("SplitsIdx").get_to(SplitsIdx);
+		j.at("Splits").get_to(Splits);
+
+		//Deserialize torch::Tensor K
+		std::vector<float> k_data = j.at("K").get<std::vector<float>>();
+		K = torch::from_blob(k_data.data(), { static_cast<long>(k_data.size()) }).clone();
+
+		//Deserialize torch::Tensor BoundingBox
+		std::vector<float> bbox_data = j.at("BoundingBox").get<std::vector<float>>();
+		BoundingBox = torch::from_blob(bbox_data.data(), { static_cast<long>(bbox_data.size()) }).clone();
+
+		//Deserialize cv::Mat d
+		std::vector<double> d_data = j.at("d").get<std::vector<double>>();
+		d = cv::Mat(d_data, true).reshape(1, 5); //Reshape to (5, 1)
+
+		//Deserialize tensors in vectors
+		auto deserialize_tensors = [](const std::vector<std::vector<float>> &serialized, at::IntArrayRef sz)
+		{
+			std::vector<torch::Tensor> tensors;
+			for (const auto &data : serialized)
+			{
+				tensors.push_back(torch::from_blob((float*)data.data(), (sz.size() == 0)?static_cast<long>(data.size()):sz).clone());
+			}
+			return tensors;
+		};
+
+		//Imgs = deserialize_tensors(j.at("Imgs").get<std::vector<std::vector<float>>>());
+		Poses = deserialize_tensors(j.at("Poses").get<std::vector<std::vector<float>>>(), {4, 4});
+		//RenderPoses = deserialize_tensors(j.at("RenderPoses").get<std::vector<std::vector<float>>>());
+	}		//CompactData::FromJson
+
+	void LoadFromFile(const std::filesystem::path &file_path)
+	{
+		std::ifstream fs(file_path);
+		nlohmann::json j;
+		fs >> j;
+		FromJson(j);
+	}
+
+	void SaveToFile(const std::filesystem::path &file_path)
+	{
+		std::ofstream fs(file_path);
+		fs << ToJson() << std::endl;
+	}
+};		//CompactData
 
 ///BoundingBox calculation
 inline torch::Tensor GetBbox3dForObj(const CompactData &data) 

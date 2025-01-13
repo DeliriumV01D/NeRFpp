@@ -31,6 +31,7 @@ set(SOURCES ${SOURCES}
 	src/PyramidEmbedder.cpp
 	src/LeRF.cpp
 	src/LeRFRenderer.cpp
+	src/ColmapReconstruction.cpp
 	src/main.cpp
 )
 
@@ -56,6 +57,7 @@ set(HEADERS ${HEADERS}
 	src/PyramidEmbedder.h
 	src/LeRF.h
 	src/LeRFRenderer.h
+	src/ColmapReconstruction.h
 )
 
 set(LIBS ${LIBS}

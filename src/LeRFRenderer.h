@@ -14,7 +14,8 @@ struct LeRFRendererOutputs {
 		DispMapLE,		///[num_rays] .Disparity map.Inverse of depth map.
 		AccMapLE,			///[num_rays] .Sum of weights along each ray.
 		WeightsLE,		///[num_rays, num_samples] .Weights assigned to each sampled embedding.
-		DepthMapLE;		///[num_rays] .Estimated distance to object.
+		DepthMapLE,		///[num_rays] .Estimated distance to object.
+		Relevancy;		///[num_rays, 2/*брать нулевую*/]
 };
 
 struct LeRFRenderResult
@@ -57,6 +58,8 @@ protected:
 	CuHashEmbedder LangEmbedFn = nullptr;
 	LeRF Lerf = nullptr;
 	LeRF LerfFine = nullptr;										///"fine" network with same spec as Lerf.
+	torch::Tensor LerfPositives, 
+		LerfNegatives;
 
 	///Prepares inputs and applies network lerf or lerf_fine.
 	virtual torch::Tensor RunLENetwork(torch::Tensor inputs, LeRF lerf, CuHashEmbedder lang_embed_fn);
@@ -73,9 +76,14 @@ public:
 	LeRFRenderer(
 		CuHashEmbedder lang_embed_fn,
 		LeRF lerf,
-		LeRF lerf_fine
-	) : LangEmbedFn (lang_embed_fn), Lerf(lerf), LerfFine(lerf_fine) {};
+		LeRF lerf_fine,
+		torch::Tensor lerf_positives = torch::Tensor(), 
+		torch::Tensor lerf_negatives = torch::Tensor()
+	) : LangEmbedFn (lang_embed_fn), Lerf(lerf), LerfFine(lerf_fine), LerfPositives(lerf_positives), LerfNegatives(lerf_negatives) {};
 	virtual ~LeRFRenderer(){};
+
+	std::tuple<torch::Tensor, torch::Tensor> GetLeRFPrompts(){ return std::make_tuple(LerfPositives, LerfNegatives); };
+	void SetLeRFPrompts (const torch::Tensor lerf_positives, const torch::Tensor lerf_negatives){LerfPositives = lerf_positives; LerfNegatives = lerf_negatives;};
 
 	///Volumetric rendering.
 	virtual LeRFRenderResult RenderRays(
