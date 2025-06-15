@@ -1,14 +1,17 @@
 #pragma once
 
-#include "json.hpp"
+
 #include "TorchHeader.h"
 #include "NeRFRenderer.h"
 //#include "RayUtils.h"
+
+#include "json.hpp"
 
 #include <filesystem>
 #include <string>
 #include <list>
 #include <vector>
+#include <fstream>
 
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/highgui/highgui.hpp>
@@ -164,7 +167,7 @@ struct CompactData {
 
 	void LoadFromFile(const std::filesystem::path &file_path)
 	{
-		std::ifstream fs(file_path);
+		std::ifstream fs(file_path.string());
 		nlohmann::json j;
 		fs >> j;
 		FromJson(j);
@@ -225,7 +228,7 @@ inline CompactData load_blender_data(const std::filesystem::path &basedir, const
 		std::filesystem::path path = basedir;
 		path /= ("transforms_" + result.Splits[i_split] + ".json");
 		std::cout << path << std::endl;
-		std::ifstream f(path);
+		std::ifstream f(path.string());
 		json data = json::parse(f);
 
 		for (auto frame : data["frames"])

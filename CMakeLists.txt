@@ -8,6 +8,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Torch REQUIRED)
 find_package(OpenCV 4.6 REQUIRED)
+if (USE_COLMAP)
+	add_definitions(-USE_COLMAP)
+	find_package(colmap REQUIRED)
+	#find_package(gflags REQUIRED)
+	add_compile_definitions(GLOG_USE_GLOG_EXPORT)
+endif()
 
 include("CMakeLists.Files.txt")
 

@@ -23,5 +23,6 @@ DISABLE_WARNING(4624)
 #endif
 
 #include <torch/torch.h>
+#include <torch/nn/parallel/data_parallel.h>
 
 DISABLE_WARNING_POP

@@ -1032,38 +1032,42 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 			int img_i = RandomInt() % (data.SplitsIdx[0] /* + 1 ? */);
 			auto target = data.Imgs[img_i].squeeze(0).to(Device);		//1, 800, 800, 4 -> 800, 800, 4
 			auto pose = poses.index({ img_i, torch::indexing::Slice(torch::indexing::None, 3), torch::indexing::Slice(torch::indexing::None, 4) });
-			torch::Tensor coords;
+
 			if (params.NRand != 0)
 			{
 				///Выбор случайных точек для батча и получение для них параметров луча
-				auto [rays_o, rays_d] = GetRays(data.H, data.W, data.K, pose);
-
+				//Вычисляем границы кадрирования один раз
+				int h_start, h_end, w_start, w_end;
 				if (i < params.PrecorpIters)
 				{
 					int dh = int(data.H / 2 * params.PrecorpFrac);
 					int dw = int(data.W / 2 * params.PrecorpFrac);
+					h_start = data.H / 2 - dh;
+					h_end = data.H / 2 + dh - 1;
+					w_start = data.W / 2 - dw;
+					w_end = data.W / 2 + dw - 1;
 
-					coords = torch::stack(
-						torch::meshgrid({
-							torch::linspace(data.H / 2 - dh, data.H / 2 + dh - 1, 2 * dh, torch::TensorOptions().dtype(torch::kLong).device(Device)),
-							torch::linspace(data.W / 2 - dw, data.W / 2 + dw - 1, 2 * dw, torch::TensorOptions().dtype(torch::kLong).device(Device))
-							}), -1);
-					if (i == this->Start + 1)
-						std::cout << "[Config] Center cropping of size " << 2 * dh << "x" << 2 * dw << " is enabled until iter " << params.PrecorpIters << std::endl;
+					if (i == Start + 1)
+						std::cout << "[Config] Center cropping of size " << 2 * dh << "x" << 2 * dw << " enabled until iter " << params.PrecorpIters << std::endl;
 				} else {
-					coords = torch::stack(torch::meshgrid({ torch::linspace(0, data.H - 1, data.H, torch::TensorOptions().dtype(torch::kLong).device(Device)), torch::linspace(0, data.W - 1, data.W, torch::TensorOptions().dtype(torch::kLong).device(Device)) }), -1);  //(H, W, 2)
+					h_start = 0;
+					h_end = data.H - 1;
+					w_start = 0;
+					w_end = data.W - 1;
 				}
 
-				coords = torch::reshape(coords, { -1, 2 });		//(H * W, 2)
+				auto [rays_o, rays_d] = GetRays(data.H, data.W, data.K, pose);
 
-				torch::Tensor select_inds = torch::randperm(coords.size(0)/*, torch::kLong*/).slice(0, 0, params.NRand);		// (N_rand,)
-				torch::Tensor select_coords = coords.index({ select_inds }).to(Device);		///!!!Вот так можно вытащить данные из по индексам записанным в другой тензор, здесь по нулевому измерению, но построить индекс можно по любому набору измерений
-				rays_o = rays_o.index({ select_coords.index({torch::indexing::Slice(), 0}), select_coords.index({ torch::indexing::Slice(), 1}) });		// (N_rand, 3)
-				rays_d = rays_d.index({ select_coords.index({torch::indexing::Slice(), 0}), select_coords.index({torch::indexing::Slice(), 1}) });		// (N_rand, 3)
-				//batch_rays = torch::stack({ rays_o, rays_d }, /*dim=*/0);
-				batch_rays.first = rays_o;
-				batch_rays.second = rays_d;
-				target_s = target.index({ select_coords.index({torch::indexing::Slice(), 0}), select_coords.index({torch::indexing::Slice(), 1}) });  // (N_rand, 3)
+				//Прямая генерация случайных координат
+				auto options = torch::TensorOptions().dtype(torch::kLong).device(Device);
+				torch::Tensor rand_h = torch::randint(h_start, h_end + 1, { params.NRand }, options);
+				torch::Tensor rand_w = torch::randint(w_start, w_end + 1, { params.NRand }, options);
+				//Эффективное извлечение данных, создаем индексы для пакетного доступа
+				//auto batch_indices = torch::stack({ rand_h, rand_w }, /*dim=*/-1);
+				//Извлекаем лучи и цвета за одну операцию
+				batch_rays.first = rays_o.index({ rand_h, rand_w });
+				batch_rays.second = rays_d.index({ rand_h, rand_w });
+				target_s = target.index({ rand_h, rand_w });
 
 				///Вычислим CLIP эмбеддинги в точках изображения которые попали в батч
 				if (Params.use_lerf)
@@ -1073,14 +1077,14 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 					pyramid_embedder_properties.Overlap = Params.pyr_embedder_overlap;										///Доля перекрытия
 					///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0, 1, 2...
 					pyramid_embedder_properties.MaxZoomOut = std::min(log2f(data.W/Params.clip_input_img_size), log2f(data.H/Params.clip_input_img_size));
-					auto select_coords_cpu = select_coords.to(torch::kCPU).to(torch::kFloat);		//!!!.item<long>()почему то не находит поэтому преобразуем во float
-					target_lang_embedding = torch::ones({select_coords_cpu.size(0)/*NRand*/, Params.lang_embed_dim}, torch::kFloat32);
+					//auto select_coords_cpu = select_coords.to(torch::kCPU).to(torch::kFloat);		//!!!.item<long>()почему то не находит поэтому преобразуем во float
+					target_lang_embedding = torch::ones({params.NRand, Params.lang_embed_dim}, torch::kFloat32);
 					#pragma omp parallel for
-					for (int idx = 0; idx < select_coords_cpu.size(0)/*NRand*/; idx++)
+					for (int idx = 0; idx < rand_h.size(0)/*NRand*/; idx++)
 					{
 						target_lang_embedding.index_put_({idx/*, torch::indexing::Slice()*/}, PyramidClipEmbedding.GetPixelValue(
-							select_coords_cpu.index({ idx, 1 }).item<float>(),
-							select_coords_cpu.index({ idx, 0 }).item<float>(),
+							rand_h.index({ idx }).to(torch::kCPU).to(torch::kFloat).item<float>(),
+							rand_w.index({ idx }).to(torch::kCPU).to(torch::kFloat).item<float>(),
 							0.5f,		///!!!ПРИВЯЗАТЬСЯ К МАСШТАБУ для этого перенести в RunNetwork по аналогии с calculated_normals			//Get zoom_out_idx from scale //-1, 0, 1, 2 ... <- 1/2, 1, 2, 4 ...
 							img_i,
 							pyramid_embedder_properties,
@@ -1259,7 +1263,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 		}
 
 		if ((i % params.ITestset == 0) && (i > 0) && !params.TestSkip)		//если TestSkip то просто не подгружены тестовые данные 
-		{
+		try {
 			auto test_save_dir = params.BaseDir; /* / ("testset_" + std::to_string(i)) */;
 			if (!std::filesystem::exists(test_save_dir))	std::filesystem::create_directories(test_save_dir);
 			//Есть torch::Tensor poses и есть std::vector<torch::Tensor> data.Poses
@@ -1287,6 +1291,8 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 				{ torch::Tensor(), torch::Tensor() }, /*c2w_staticcam*/torch::Tensor(), /*test_imgs,*/ test_save_dir
 			);
 			std::cout << "Saved test set" << std::endl;
+		} catch (std::exception &e) {
+			std::cerr << e.what() << std::endl;
 		}
 
 		if ((i % params.IVideo == 0) && i > 0)

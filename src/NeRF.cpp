@@ -233,7 +233,7 @@ torch::Tensor HashEmbedderImpl :: Hash(torch::Tensor coords, const long log2_has
 	torch::Tensor xor_result = torch::zeros_like(coords).index({ "...", 0 }).to(coords.device());
 	for (int64_t i = 0; i < coords.sizes().back(); i++)
 		xor_result ^= coords.index({ "...", i }) * primes[i];
-	return torch::tensor((1ll << static_cast<long long>(log2_hashmap_size)) - 1ll, torch::kLong).to(xor_result.device()) & xor_result;
+	return torch::tensor({(1ll << static_cast<long long>(log2_hashmap_size)) - 1ll}, torch::kLong).to(xor_result.device()) & xor_result;
 }
 
 HashEmbedderImpl :: HashEmbedderImpl(

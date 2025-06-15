@@ -7,7 +7,7 @@ inline torch::Tensor SamplePDF(torch::Tensor bins, torch::Tensor weights, const 
 {
 	torch::Device device = weights.device();
 	//Get probability density function (PDF)
-	weights = weights + 1e-5;
+	weights = weights + 1e-8;
 	auto pdf = weights / torch::sum(weights, -1, true);
 	auto cdf = torch::cumsum(pdf, -1);
 	cdf = torch::cat({ torch::zeros_like(cdf.index({ "...", torch::indexing::Slice(torch::indexing::None, 1)})), cdf }, -1);		//[batch, len(bins)]

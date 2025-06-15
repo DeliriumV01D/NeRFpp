@@ -56,6 +56,7 @@ inline cv::Mat TorchTensorToCVMat(torch::Tensor tensor_image, const bool perm = 
 	if (perm)
 		t = t.permute({ 1, 2, 0 });
 	t = t.mul(255).clamp(0, 255).to(torch::kU8);
+	t = t.contiguous();
 	cv::Mat result_img;
 	cv::Mat(t.size(0), t.size(1), CV_MAKETYPE(CV_8U, t.sizes().size() >= 3 ? t.size(2) : 1), t.data_ptr()).copyTo(result_img);
 	return result_img;
@@ -133,7 +134,7 @@ public:
 
 ///Prepares inputs and applies network 'fn'.
 template <class TEmbedder, class TEmbedDirs, class TNeRF>
-torch::Tensor NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: RunNetwork(
+torch::Tensor NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> ::RunNetwork(
 	torch::Tensor inputs,
 	torch::Tensor view_dirs,			///defined if use_view_dirs
 	TNeRF fn,
@@ -141,9 +142,9 @@ torch::Tensor NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: RunNetwork(
 	TEmbedDirs embeddirs_fn
 ) {
 	//можно попробовать научить работать эмбедер с батчами чтобы не плющить тензоры?
-	torch::Tensor inputs_flat = torch::reshape(inputs, { -1, inputs.sizes().back()/*[-1]*/ });  //[1024, 256, 3] -> [262144, 3]
+	torch::Tensor inputs_flat = inputs.view({ -1, inputs.sizes().back()/*[-1]*/ });  //[1024, 256, 3] -> [262144, 3]
 	inputs_flat.set_requires_grad(false);
-	auto [embedded, keep_mask] = embed_fn->forward(inputs_flat); 
+	auto [embedded, keep_mask] = embed_fn->forward(inputs_flat);
 
 	if (view_dirs.defined() && view_dirs.numel() != 0)
 	{
@@ -161,8 +162,7 @@ torch::Tensor NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: RunNetwork(
 	std::vector<int64_t> sz = inputs.sizes().vec();
 	sz.pop_back();
 	sz.push_back(outputs_flat.sizes().back());
-	torch::Tensor outputs = torch::reshape(outputs_flat, sz);  //list(inputs.shape[:-1]) + [outputs_flat.shape[-1]]  //[262144, 5] -> [1024, 256, 5]
-	return outputs;
+	return outputs_flat.view(sz);
 }
 
 

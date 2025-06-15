@@ -1,8 +1,7 @@
 #pragma once
+#include "load_blender.h"
 
 #include "TorchHeader.h"
-
-#include "load_blender.h"
 
 #include <string>
 #include <iostream>
@@ -13,5 +12,5 @@
 
 void ColmapReconstruction(	const std::filesystem::path &image_path, const std::filesystem::path &workspace_path);
 
-///Чтение параметров камер из базы данных colmap реконструкции
+///Р§С‚РµРЅРёРµ РїР°СЂР°РјРµС‚СЂРѕРІ РєР°РјРµСЂ РёР· Р±Р°Р·С‹ РґР°РЅРЅС‹С… colmap СЂРµРєРѕРЅСЃС‚СЂСѓРєС†РёРё
 CompactData LoadFromColmapReconstruction( const std::filesystem::path &workspace_path);

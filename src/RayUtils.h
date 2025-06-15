@@ -4,21 +4,26 @@
 
 inline torch::Tensor GetDirections(const int h, const int w, torch::Tensor k)
 {
-	auto device = k.device();
-	//pytorch's meshgrid has indexing='ij'
-	std::vector<torch::Tensor> ij = torch::meshgrid({ torch::linspace(0, w - 1, w), torch::linspace(0, h - 1, h) });
-	auto i = ij[0].to(device).t();
-	auto j = ij[1].to(device).t();
-	torch::Tensor dirs = torch::stack({ (i - k[0][2]) / k[0][0], -(j - k[1][2]) / k[1][1], -torch::ones_like(i) }, -1);
-	return dirs;
+	const auto device = k.device();
+	const auto options = torch::TensorOptions().device(device);
+	//Создаем сетку на целевом устройстве (без транспонирования)
+	auto y_range = torch::linspace(0, h - 1, h, options).view({ h, 1 }).expand({ h, w });
+	auto x_range = torch::linspace(0, w - 1, w, options).view({ 1, w }).expand({ h, w });
+	const auto fx = k[0][0];
+	const auto cx = k[0][2];
+	const auto fy = k[1][1];
+	const auto cy = k[1][2];
+	//Вычисляем направления (векторизованные операции)
+	auto dir_x = (x_range - cx) / fx;
+	auto dir_y = -(y_range - cy) / fy;
+	auto dir_z = -torch::ones_like(x_range);
+	return torch::stack({ dir_x, dir_y, dir_z }, -1); // [h, w, 3]
 }
 
 inline std::pair<torch::Tensor, torch::Tensor> GetRays(const int h, const int w, torch::Tensor k, torch::Tensor c2w)
 {
 	auto device = c2w.device();
 	torch::Tensor dirs = GetDirections(h, w, k).to(device);
-
-	//std::cout << (dirs.unsqueeze(-2) * c2w.slice(0, 0, 3).slice(1, 0, 3)).sizes() << std::endl;
 	//Rotate ray directions from camera frame to the world frame
 	auto rays_d = torch::sum(
 		dirs.index({ "...", torch::indexing::None, torch::indexing::Slice() })

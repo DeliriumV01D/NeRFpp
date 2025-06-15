@@ -14,6 +14,11 @@ link_directories(
 	"C:/Program Files (x86)/Intel/oneAPI/mkl/2022.1.0/lib/intel64"
 )
 
+if (USE_COLMAP)
+include_directories(C:/vcpkg/installed/x64-windows/include)
+link_directories("C:/vcpkg/installed/x64-windows/lib")
+endif()
+
 set(SOURCES ${SOURCES}
 	src/LibTorchTraining/Trainable.cpp
 	src/CuSHEncoder.cpp
@@ -31,6 +36,8 @@ set(SOURCES ${SOURCES}
 	src/PyramidEmbedder.cpp
 	src/LeRF.cpp
 	src/LeRFRenderer.cpp
+	src/NeRFactor.cpp
+	src/NeRFactorRenderer.cpp
 	src/ColmapReconstruction.cpp
 	src/main.cpp
 )
@@ -57,12 +64,15 @@ set(HEADERS ${HEADERS}
 	src/PyramidEmbedder.h
 	src/LeRF.h
 	src/LeRFRenderer.h
+	src/NeRFactor.h
+	src/NeRFactorRenderer.h
 	src/ColmapReconstruction.h
 )
 
 set(LIBS ${LIBS}
 	${OpenCV_LIBS}
 	${TORCH_LIBRARIES}
+	colmap::colmap
 )
 
 if(MSVC_IDE)
