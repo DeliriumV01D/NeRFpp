@@ -190,8 +190,7 @@ struct NeRFExecutorTrainParams {
 	bool TestSkip{ false },						///will load 1/N images from test/val sets, useful for large datasets like deepvoxels
 		RenderOnly{ false },					///do not optimize, reload weights and render out render_poses path
 		Ndc{ false },									///use normalized device coordinates (set for non-forward facing scenes)
-		LinDisp{ false },							///sampling linearly in disparity rather than depth
-		NoBatching{ true };						///only take random rays from 1 image at a time
+		LinDisp{ false };							///sampling linearly in disparity rather than depth
 	int Chunk{ 1024 * 32 },					///number of rays processed in parallel, decrease if running out of memory не влияет на качество
 		NSamples{ 64 },								///number of coarse samples per ray
 		NRand{ 32 * 32 * 4 },					///batch size (number of random rays per gradient step) must be < H * W
@@ -217,7 +216,6 @@ struct NeRFExecutorTrainParams {
 		j["RenderOnly"] = RenderOnly;
 		j["Ndc"] = Ndc;
 		j["LinDisp"] = LinDisp;
-		j["NoBatching"] = NoBatching;
 		j["Chunk"] = Chunk;
 		j["NSamples"] = NSamples;
 		j["NRand"] = NRand;
@@ -243,7 +241,6 @@ struct NeRFExecutorTrainParams {
 		j.at("RenderOnly").get_to(RenderOnly);
 		j.at("Ndc").get_to(Ndc);
 		j.at("LinDisp").get_to(LinDisp);
-		j.at("NoBatching").get_to(NoBatching);
 		j.at("Chunk").get_to(Chunk);
 		j.at("NSamples").get_to(NSamples);
 		j.at("NRand").get_to(NRand);
@@ -350,7 +347,8 @@ protected:
 	std::unique_ptr<torch::optim::Adam> Optimizer;
 	int Start = 0,
 		NImportance{ 0 };
-	float LearningRate;
+	float LearningRate,
+		StochasticPreconditioningAlpha0;
 	torch::Device Device;
 	bool UseViewDirs;									//use full 5D input instead of 3D
 	CLIP Clip = nullptr;
@@ -392,6 +390,8 @@ public:
 		NeRFExecutorTrainParams executor_train_params,
 		const float Near,
 		const float Far,
+		const int iter = std::numeric_limits<int>::max(),
+		torch::Tensor BoundingBox = torch::Tensor(),
 		const bool returm_weights = false,
 		const bool calculate_normals = false
 	);
@@ -405,6 +405,7 @@ public:
 
 	///
 	void Train(const CompactData &data, NeRFExecutorTrainParams &params);
+	void SaveCheckpoint(const std::filesystem::path &path, const int global_step /*= 0*/);
 	NeRFExecutorParams GetParams(){return Params;};
 	torch::Tensor GetEmbedderBoundingBox(){return ExecutorEmbedder->GetBoundingBox();};
 	torch::Tensor GetLangEmbedderBoundingBox(){return LangEmbedder->GetBoundingBox();};
@@ -419,6 +420,8 @@ NeRFRenderParams * NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TL
 	NeRFExecutorTrainParams executor_train_params,
 	const float Near,
 	const float Far,
+	const int iter /*= std::numeric_limits<int>::max()*/,
+	torch::Tensor BoundingBox /*= torch::Tensor()*/,
 	const bool returm_weights /*= false*/,
 	const bool calculate_normals /*= false*/
 ){
@@ -446,6 +449,10 @@ NeRFRenderParams * NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TL
 	render_params->ReturnWeights = returm_weights;
 	render_params->RenderFactor = executor_train_params.RenderFactor;
 
+	render_params->BoundingBox = BoundingBox;
+	render_params->RawNoiseStd = std::max(0.0f, 1.0f - static_cast<float>(iter) / (static_cast<float>(executor_train_params.NIters) / 4));  //Локальная регуляризация плотности помогает избежать артефактов типа "облаков" затухает за n_iters / 3 итераций
+	render_params->StochasticPreconditioningAlpha = StochasticPreconditioningAlpha0 * std::max(0.0f, 1.0f - static_cast<float>(iter) / (static_cast<float>(executor_train_params.NIters) / 3));  //добавляет шум к входу сети (координатам точек). Уменьшает чувствительность к инициализации. Помогает избежать "плавающих" артефактов
+	
 	return render_params;
 }
 
@@ -666,6 +673,13 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 			std::vector<double>({ 0.26862954, 0.26130258, 0.27577711 })
 		);
 	}
+
+	//for stochastic preconditioning
+	std::vector<torch::Tensor> bounds = torch::split(bounding_box, { 3, 3 }, -1);
+	auto min_bound = bounds[0];
+	auto max_bound = bounds[1];
+	auto bbox_diag = torch::norm(max_bound - min_bound).item<float>();
+	StochasticPreconditioningAlpha0 = 0.02f * bbox_diag;
 }			//NeRFExecutor :: Initialize
 
 
@@ -920,79 +934,12 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 	if (Params.use_lerf)
 		InitializePyramidClipEmbedding(params, data, true);
 
-	////NDC only good for LLFF - style forward facing data
-	//if (params.DatasetType != DatasetType::LLFF)
-	//{
-	//	std::cout << "Not ndc!" << std::endl;
-	//	params.Ndc = false;
-	//}
-
-	////Если требуется то будем рендерить в тестовых позициях см еще код ниже
-	//if (params.RenderTest)
-	//	render_poses = np.array(poses[i_test взять из data.SplitsIdx])
-	//Create log dir and copy the config file ....
-
 	int global_step = Start;
-
-	//Short circuit if only rendering out from trained model
-	if (params.RenderOnly)
-	{
-		std::cout << "RENDER ONLY" << std::endl;
-		torch::NoGradGuard no_grad;
-
-		auto test_save_dir = params.BaseDir / (std::string("renderonly_") + /*params.RenderTest ? "test_" :*/ "path_" + std::to_string(Start));
-		if (!std::filesystem::exists(test_save_dir))	std::filesystem::create_directories(test_save_dir);
-		std::cout << "test_poses_shape: " << data.RenderPoses.size() << std::endl;
-
-		std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, false, false));
-		RenderPath(data.RenderPoses, data.H, data.W, data.Focal, data.K, *render_params, 
-			{ torch::Tensor(), torch::Tensor() }, /*c2w_staticcam*/torch::Tensor(), /*data.Imgs,*/ test_save_dir
-		);
-
-		//cv::VideoWriter video((test_save_dir / "video.avi").string(), cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), 30, cv::Size(data.W, data.H), true);
-		//for (auto &img : rgbs)
-		//	video.write(TorchTensorToCVMat(img));
-		//video.release();
-
-		std::cout << "Done rendering " << test_save_dir << std::endl;
-		return;
-	}		//if (params.RenderOnly)
 
 	//Prepare raybatch tensor if batching random rays
 	int i_batch;
 	torch::Tensor rays_rgb;
-	if (!params.NoBatching)
-	{
-		std::cout << "get rays" << std::endl;
-		std::vector<torch::Tensor> rays;
-
-		for (auto pose : data.Poses)
-		{
-			auto [rays_o, rays_d] = GetRays(data.H, data.W, data.K, pose.index({ torch::indexing::Slice(torch::indexing::None, 3), torch::indexing::Slice(torch::indexing::None, 4) }));
-			rays.emplace_back(torch::cat({ rays_o, rays_d }, 0/*?*/));	//[N, ro + rd, H, W, 3]
-		}
-		rays_rgb = torch::stack(rays, 0);								//[N, ro + rd, H, W, 3]
-		rays_rgb = torch::cat({ rays_rgb, torch::stack(data.Imgs, 0) }, 1);				//[N, ro + rd + rgb, H, W, 3]
-
-		//numpy.transpose is same as torch.permute
-		rays_rgb = rays_rgb.permute({ 0, 2, 3, 1, 4 });			//[N, H, W, ro + rd + rgb, 3]
-
-		rays_rgb = rays_rgb.index({ torch::indexing::Slice(torch::indexing::None, data.SplitsIdx[0]) });		//train images only
-		//A single dimension may be - 1, in which case it’s inferred from the remaining dimensionsand the number of elements in input.
-		rays_rgb = torch::reshape(rays_rgb, { -1/*?*/, 3, 3 });		//[(N - 1) * H * W, ro + rd + rgb, 3]
-		std::cout << "shuffle rays" << std::endl;
-		rays_rgb = rays_rgb.index({ torch::randperm(rays_rgb.sizes()[0]) });
-		std::cout << "done " << rays_rgb.sizes() << std::endl;
-		i_batch = 0;
-	}	//if (!params.NoBatching)
-
-	//Move training data to GPU
 	torch::Tensor images;
-	if (!params.NoBatching)
-	{
-		images = torch::stack(data.Imgs, 0).to(Device);
-		rays_rgb = rays_rgb.to(Device);
-	}
 	torch::Tensor poses = torch::stack(data.Poses, 0).to(Device);
 
 	int n_iters = params.NIters + 1;
@@ -1010,90 +957,72 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 		torch::Tensor batch,
 			target_s;
 		torch::Tensor target_lang_embedding;
-		if (!params.NoBatching)
+
+		//Random from one image
+		int img_i = RandomInt() % (data.SplitsIdx[0] /* + 1 ? */);
+		auto target = data.Imgs[img_i].squeeze(0).to(Device);		//1, 800, 800, 4 -> 800, 800, 4
+		auto pose = poses.index({ img_i, torch::indexing::Slice(torch::indexing::None, 3), torch::indexing::Slice(torch::indexing::None, 4) });
+
+		if (params.NRand != 0)
 		{
-			//Random over all images
-			batch = rays_rgb.index({ torch::indexing::Slice(i_batch, i_batch + params.NRand) });
-			batch = torch::transpose(batch, 0, 1);
-			batch_rays.first = batch.index({ torch::indexing::Slice(torch::indexing::None, 2) });
-			auto temp = torch::split(batch_rays.first, int(batch_rays.first.size(0) / 2), /*dim*/0);
-			batch_rays.first = temp[0];
-			batch_rays.second = temp[1];
-			target_s = batch.index({ 2 });
-			i_batch += params.NRand;
-			if (i_batch > rays_rgb.sizes()[0])
+			///Выбор случайных точек для батча и получение для них параметров луча
+			//Вычисляем границы кадрирования один раз
+			int h_start, h_end, w_start, w_end;
+			if (i < params.PrecorpIters)
 			{
-				std::cout << "Shuffle data after an epoch!" << std::endl;
-				rays_rgb = rays_rgb.index({ torch::randperm(rays_rgb.sizes()[0]) });
-				i_batch = 0;
+				int dh = int(data.H / 2 * params.PrecorpFrac);
+				int dw = int(data.W / 2 * params.PrecorpFrac);
+				h_start = data.H / 2 - dh;
+				h_end = data.H / 2 + dh - 1;
+				w_start = data.W / 2 - dw;
+				w_end = data.W / 2 + dw - 1;
+
+				if (i == Start + 1)
+					std::cout << "[Config] Center cropping of size " << 2 * dh << "x" << 2 * dw << " enabled until iter " << params.PrecorpIters << std::endl;
+			} else {
+				h_start = 0;
+				h_end = data.H - 1;
+				w_start = 0;
+				w_end = data.W - 1;
 			}
-		} else {
-			//Random from one image
-			int img_i = RandomInt() % (data.SplitsIdx[0] /* + 1 ? */);
-			auto target = data.Imgs[img_i].squeeze(0).to(Device);		//1, 800, 800, 4 -> 800, 800, 4
-			auto pose = poses.index({ img_i, torch::indexing::Slice(torch::indexing::None, 3), torch::indexing::Slice(torch::indexing::None, 4) });
 
-			if (params.NRand != 0)
+			auto [rays_o, rays_d] = GetRays(data.H, data.W, data.K, pose);
+
+			//Прямая генерация случайных координат
+			auto options = torch::TensorOptions().dtype(torch::kLong).device(Device);
+			torch::Tensor rand_h = torch::randint(h_start, h_end + 1, { params.NRand }, options);
+			torch::Tensor rand_w = torch::randint(w_start, w_end + 1, { params.NRand }, options);
+			//Эффективное извлечение данных, создаем индексы для пакетного доступа
+			//auto batch_indices = torch::stack({ rand_h, rand_w }, /*dim=*/-1);
+			//Извлекаем лучи и цвета за одну операцию
+			batch_rays.first = rays_o.index({ rand_h, rand_w });
+			batch_rays.second = rays_d.index({ rand_h, rand_w });
+			target_s = target.index({ rand_h, rand_w });
+
+			///Вычислим CLIP эмбеддинги в точках изображения которые попали в батч
+			if (Params.use_lerf)
 			{
-				///Выбор случайных точек для батча и получение для них параметров луча
-				//Вычисляем границы кадрирования один раз
-				int h_start, h_end, w_start, w_end;
-				if (i < params.PrecorpIters)
+				PyramidEmbedderProperties pyramid_embedder_properties; 
+				pyramid_embedder_properties.ImgSize = {Params.clip_input_img_size, Params.clip_input_img_size};	//Входной размер изображения сети
+				pyramid_embedder_properties.Overlap = Params.pyr_embedder_overlap;										///Доля перекрытия
+				///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0, 1, 2...
+				pyramid_embedder_properties.MaxZoomOut = std::min(log2f(data.W/Params.clip_input_img_size), log2f(data.H/Params.clip_input_img_size));
+				//auto select_coords_cpu = select_coords.to(torch::kCPU).to(torch::kFloat);		//!!!.item<long>()почему то не находит поэтому преобразуем во float
+				target_lang_embedding = torch::ones({params.NRand, Params.lang_embed_dim}, torch::kFloat32);
+				#pragma omp parallel for
+				for (int idx = 0; idx < rand_h.size(0)/*NRand*/; idx++)
 				{
-					int dh = int(data.H / 2 * params.PrecorpFrac);
-					int dw = int(data.W / 2 * params.PrecorpFrac);
-					h_start = data.H / 2 - dh;
-					h_end = data.H / 2 + dh - 1;
-					w_start = data.W / 2 - dw;
-					w_end = data.W / 2 + dw - 1;
-
-					if (i == Start + 1)
-						std::cout << "[Config] Center cropping of size " << 2 * dh << "x" << 2 * dw << " enabled until iter " << params.PrecorpIters << std::endl;
-				} else {
-					h_start = 0;
-					h_end = data.H - 1;
-					w_start = 0;
-					w_end = data.W - 1;
+					target_lang_embedding.index_put_({idx/*, torch::indexing::Slice()*/}, PyramidClipEmbedding.GetPixelValue(
+						rand_h.index({ idx }).to(torch::kCPU).to(torch::kFloat).item<float>(),
+						rand_w.index({ idx }).to(torch::kCPU).to(torch::kFloat).item<float>(),
+						0.5f,		///!!!ПРИВЯЗАТЬСЯ К МАСШТАБУ для этого перенести в RunNetwork по аналогии с calculated_normals			//Get zoom_out_idx from scale //-1, 0, 1, 2 ... <- 1/2, 1, 2, 4 ...
+						img_i,
+						pyramid_embedder_properties,
+						cv::Size(data.W, data.H)
+					));
 				}
-
-				auto [rays_o, rays_d] = GetRays(data.H, data.W, data.K, pose);
-
-				//Прямая генерация случайных координат
-				auto options = torch::TensorOptions().dtype(torch::kLong).device(Device);
-				torch::Tensor rand_h = torch::randint(h_start, h_end + 1, { params.NRand }, options);
-				torch::Tensor rand_w = torch::randint(w_start, w_end + 1, { params.NRand }, options);
-				//Эффективное извлечение данных, создаем индексы для пакетного доступа
-				//auto batch_indices = torch::stack({ rand_h, rand_w }, /*dim=*/-1);
-				//Извлекаем лучи и цвета за одну операцию
-				batch_rays.first = rays_o.index({ rand_h, rand_w });
-				batch_rays.second = rays_d.index({ rand_h, rand_w });
-				target_s = target.index({ rand_h, rand_w });
-
-				///Вычислим CLIP эмбеддинги в точках изображения которые попали в батч
-				if (Params.use_lerf)
-				{
-					PyramidEmbedderProperties pyramid_embedder_properties; 
-					pyramid_embedder_properties.ImgSize = {Params.clip_input_img_size, Params.clip_input_img_size};	//Входной размер изображения сети
-					pyramid_embedder_properties.Overlap = Params.pyr_embedder_overlap;										///Доля перекрытия
-					///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0, 1, 2...
-					pyramid_embedder_properties.MaxZoomOut = std::min(log2f(data.W/Params.clip_input_img_size), log2f(data.H/Params.clip_input_img_size));
-					//auto select_coords_cpu = select_coords.to(torch::kCPU).to(torch::kFloat);		//!!!.item<long>()почему то не находит поэтому преобразуем во float
-					target_lang_embedding = torch::ones({params.NRand, Params.lang_embed_dim}, torch::kFloat32);
-					#pragma omp parallel for
-					for (int idx = 0; idx < rand_h.size(0)/*NRand*/; idx++)
-					{
-						target_lang_embedding.index_put_({idx/*, torch::indexing::Slice()*/}, PyramidClipEmbedding.GetPixelValue(
-							rand_h.index({ idx }).to(torch::kCPU).to(torch::kFloat).item<float>(),
-							rand_w.index({ idx }).to(torch::kCPU).to(torch::kFloat).item<float>(),
-							0.5f,		///!!!ПРИВЯЗАТЬСЯ К МАСШТАБУ для этого перенести в RunNetwork по аналогии с calculated_normals			//Get zoom_out_idx from scale //-1, 0, 1, 2 ... <- 1/2, 1, 2, 4 ...
-							img_i,
-							pyramid_embedder_properties,
-							cv::Size(data.W, data.H)
-						));
-					}
-				}		//if use_lerf
-			}		//if (params.NRand != 0)
-		}		// else (!params.NoBatching)
+			}		//if use_lerf
+		}		//if (params.NRand != 0)
 
 		//Core optimization loop
 		Optimizer->zero_grad();
@@ -1103,7 +1032,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 
 		if (Params.use_nerf)
 		{
-			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, true, Params.calculate_normals || Params.use_pred_normal));
+			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, i, data.BoundingBox, true, Params.calculate_normals || Params.use_pred_normal));
 			auto rgb_disp_acc_extras = std::move(NeRFRenderer->Render(data.H, data.W, data.K,
 				*render_params, batch_rays, torch::Tensor(), torch::Tensor()				/*либо rays либо pose c2w*/
 			));
@@ -1168,7 +1097,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 		//if (Params.use_nerfactor)
 		if constexpr (std::is_same_v<TNeRF, NeRFactor>)
 		{
-			//std::unique_ptr<NeRFactorRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, true, Params.calculate_normals || Params.use_pred_normal));
+			//std::unique_ptr<NeRFactorRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, i, data.BoundingBox, true, Params.calculate_normals || Params.use_pred_normal));
 			//auto nerfactor_render_result = std::move(NeRFactorRenderer->Render(data.H, data.W, data.K,
 			//	*render_params, batch_rays, torch::Tensor(), torch::Tensor()				/*либо rays либо pose c2w*/
 			//));
@@ -1198,7 +1127,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 		const float lang_loss_weight = 1e-1f;//1e-2f;
 		if (Params.use_lerf)
 		{
-			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, true, Params.calculate_normals || Params.use_pred_normal));
+			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, i, data.BoundingBox, true, Params.calculate_normals || Params.use_pred_normal));
 			auto lerf_render_result = std::move(LeRFRenderer->Render(data.H, data.W, data.K,
 				*render_params, batch_rays, torch::Tensor(), torch::Tensor()				/*либо rays либо pose c2w*/
 			));
@@ -1241,24 +1170,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 		if (i % params.IWeights == 0)
 		{
 			auto path = params.BaseDir; /* / (std::to_string(i) + ".tar") */;
-			if (!std::filesystem::exists(path))	std::filesystem::create_directories(path);
-			if (Params.use_nerf)
-			{
-				torch::save(ExecutorEmbedder, (path / "embedder_checkpoint.pt").string());
-				torch::save(Model, (path / "model_checkpoint.pt").string());
-				if (!ModelFine.is_empty())
-					torch::save(ModelFine, (path / "model_fine_checkpoint.pt").string());
-			}
-			if (Params.use_lerf)
-			{
-				torch::save(LangEmbedder, (path / "lang_embedder_checkpoint.pt").string());
-				torch::save(LangModel, (path / "lang_model_checkpoint.pt").string());
-				if (!LangModelFine.is_empty())
-					torch::save(LangModelFine, (path / "lang_model_fine_checkpoint.pt").string());
-			}
-			torch::save(torch::full({ 1 }, /*value=*/global_step), (path / "start_checkpoint.pt").string());
-			torch::save(*Optimizer.get(), (path / "optimizer_checkpoint.pt").string());
-
+			SaveCheckpoint(path, global_step);
 			std::cout << "Saved checkpoints at " << path.string() << std::endl;
 		}
 
@@ -1276,17 +1188,13 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 			if (data.SplitsIdx[2] == data.SplitsIdx[1] || data.SplitsIdx[2] == 0)
 			{
 				for (int k = 0; k < data.SplitsIdx[0]; k++)
-				{
 					test_poses.push_back(data.Poses[k].to(Device));
-				}
 			} else {
 				for (int k = data.SplitsIdx[0] + data.SplitsIdx[1]; k < data.SplitsIdx[0] + data.SplitsIdx[1] + data.SplitsIdx[2]; k++)
-				{
 					test_poses.push_back(data.Poses[k].to(Device));
-				}
 			}
 
-			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, false, false));
+			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, std::numeric_limits<int>::max(), torch::Tensor(), false, false));
 			RenderPath(test_poses/*poses[i_test]).to(device)*/, data.H, data.W, data.Focal, data.K, *render_params,
 				{ torch::Tensor(), torch::Tensor() }, /*c2w_staticcam*/torch::Tensor(), /*test_imgs,*/ test_save_dir
 			);
@@ -1300,29 +1208,13 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 			torch::NoGradGuard no_grad;
 			auto dir = params.BaseDir / "render";
 			if (!std::filesystem::exists(dir))	std::filesystem::create_directories(dir);
-			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, false, false));
+			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, std::numeric_limits<int>::max(), torch::Tensor(), false, false));
 			RenderPath(data.RenderPoses, data.H, data.W, data.Focal, data.K, *render_params, { torch::Tensor(), torch::Tensor() },
 				/*c2w_staticcam*/torch::Tensor(),/*, data.Imgs,*/  dir/*, params.RenderFactor*/
 			);
 			std::cout << "Done, saving " << std::endl;
 			auto path = params.BaseDir; /* / ("spiral_" + std::to_string(i)) */;
 			if (!std::filesystem::exists(path))	std::filesystem::create_directories(path);
-
-			//cv::VideoWriter video((params.BaseDir / "rgb.avi").string(), cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), 30, cv::Size(data.W, data.H), true);
-			//for (auto &img : rgbs)
-			//	video.write(TorchTensorToCVMat(img));
-			//video.release();
-
-			//cv::VideoWriter video2((params.BaseDir / "disp.avi").string(), cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), 30, cv::Size(data.W, data.H), true);
-			//for (auto &img : disps)
-			//{
-			//	float min_val = img.min().item<float>();
-			//	float max_val = img.max().item<float>();
-			//	// Нормализуем тензор
-			//	img = (img - min_val) / (max_val - min_val);
-			//	video2.write(TorchTensorToCVMat(img));
-			//}
-			//video2.release();
 		}
 
 		if (i % params.IPrint == 0)
@@ -1331,3 +1223,28 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 		global_step++;
 	}	//for (int i = this->Start + 1; i < n_iters; i++)
 }			//NeRFExecutor :: Train
+
+
+///
+template <typename TEmbedder, typename TEmbedDirs, typename TNeRF, typename TNeRFRenderer,
+	typename TLeRFEmbedder, typename TLeRF, typename TLeRFRenderer>
+void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, TLeRF, TLeRFRenderer> :: SaveCheckpoint(const std::filesystem::path &path, const int global_step /*= 0*/)
+{
+	if (!std::filesystem::exists(path))	std::filesystem::create_directories(path);
+	if (Params.use_nerf)
+	{
+		torch::save(ExecutorEmbedder, (path / "embedder_checkpoint.pt").string());
+		torch::save(Model, (path / "model_checkpoint.pt").string());
+		if (!ModelFine.is_empty())
+			torch::save(ModelFine, (path / "model_fine_checkpoint.pt").string());
+	}
+	if (Params.use_lerf)
+	{
+		torch::save(LangEmbedder, (path / "lang_embedder_checkpoint.pt").string());
+		torch::save(LangModel, (path / "lang_model_checkpoint.pt").string());
+		if (!LangModelFine.is_empty())
+			torch::save(LangModelFine, (path / "lang_model_fine_checkpoint.pt").string());
+	}
+	torch::save(torch::full({ 1 }, /*value=*/global_step), (path / "start_checkpoint.pt").string());
+	torch::save(*Optimizer.get(), (path / "optimizer_checkpoint.pt").string());
+}

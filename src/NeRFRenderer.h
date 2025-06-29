@@ -31,13 +31,15 @@ struct NeRFRenderParams {
 	bool LinDisp{false};						///If True, sample linearly in inverse depth rather than in depth.
 	float Perturb{0.f};							///0. or 1. If non - zero, each ray is sampled at stratified random points in time.
 	bool WhiteBkgr{false};					///If True, assume a white background.
-	float RawNoiseStd{0.};
+	float RawNoiseStd{0.};			///Локальная регуляризация плотности (выход) помогает избежать артефактов типа "облаков" затухает за n_iters / 3 итераций
 	bool Ndc{true};							///If True, represent ray origin, direction in NDC coordinates.
 	float Near{0.};							///float or array of shape[batch_size].Nearest distance for a ray.
 	float Far{1.};							///float or array of shape[batch_size].Farthest distance for a ray.
 	bool UseViewdirs{false};		///If True, use viewing direction of a point in space in model.
 	bool ReturnWeights{false};
 	float RenderFactor{0};
+	torch::Tensor BoundingBox{torch::Tensor()};
+	float StochasticPreconditioningAlpha{0};	///добавляет шум к входу сети (координатам точек). Уменьшает чувствительность к инициализации. Помогает избежать "плавающих" артефактов
 };
 
 inline torch::Tensor CVMatToTorchTensor(cv::Mat img, const bool perm = false)
@@ -100,7 +102,9 @@ public:
 		const float perturb = 0.f,							///0. or 1. If non - zero, each ray is sampled at stratified random points in time.
 		const int n_importance = 0,							///Number of additional times to sample along each ray.
 		const bool white_bkgr = false,					///If True, assume a white background.
-		const float raw_noise_std = 0.,
+		const float raw_noise_std = 0.f,				///Локальная регуляризация плотности (выход) помогает избежать артефактов типа "облаков" затухает за n_iters / 3 итераций
+		const float stochastic_preconditioning_alpha = 0.f,///добавляет шум к входу сети (координатам точек). Уменьшает чувствительность к инициализации. Помогает избежать "плавающих" артефактов
+		torch::Tensor bounding_box  = torch::Tensor(),
 		const bool return_weights = true
 	);
 
@@ -116,6 +120,8 @@ public:
 		const int n_importance = 0,							///Number of additional times to sample along each ray.
 		const bool white_bkgr = false,					///If True, assume a white background.
 		const float raw_noise_std = 0.,
+		const float stochastic_preconditioning_alpha = 0.f,
+		torch::Tensor bounding_box  = torch::Tensor(),
 		const bool return_weights = true
 	);
 
@@ -144,6 +150,7 @@ torch::Tensor NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> ::RunNetwork(
 	//можно попробовать научить работать эмбедер с батчами чтобы не плющить тензоры?
 	torch::Tensor inputs_flat = inputs.view({ -1, inputs.sizes().back()/*[-1]*/ });  //[1024, 256, 3] -> [262144, 3]
 	inputs_flat.set_requires_grad(false);
+	
 	auto [embedded, keep_mask] = embed_fn->forward(inputs_flat);
 
 	if (view_dirs.defined() && view_dirs.numel() != 0)
@@ -186,13 +193,13 @@ NeRFRendererOutputs NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: RawToOutputs(
 		dists.set_requires_grad(true);
 
 	auto rgb = torch::sigmoid(raw.index({ "...", torch::indexing::Slice(torch::indexing::None, 3) }));		//[N_rays, N_samples, 3] извлекает значения из первых трех столбцов тензора raw
-	torch::Tensor noise = torch::zeros(raw.index({ "...", 3 }).sizes(), torch::kFloat32).to(device);
+	
+	auto density_before_activation = raw.index({ "...", 3 });		//    извлекает значения (sigma) из четвертого столбца raw
 	if (raw_noise_std > 0.f)
 	{
-		noise = (torch::randn(raw.index({ "...", 3 }).sizes()) * raw_noise_std).to(device);
+		density_before_activation = density_before_activation + torch::randn_like(density_before_activation) * raw_noise_std;
 	}
-	auto density_before_activation = raw.index({ "...", 3 });		//    извлекает значения (sigma) из четвертого столбца raw
-	torch::Tensor alpha = raw2alpha(density_before_activation + noise, dists);  //[N_rays, N_samples]
+	torch::Tensor alpha = raw2alpha(density_before_activation, dists);  //[N_rays, N_samples]
 	result.Weights = alpha * torch::cumprod(
 		torch::cat({ torch::ones({alpha.sizes()[0], 1}).to(device), -alpha + 1.f + 1e-10f }, -1),
 		-1
@@ -211,6 +218,27 @@ NeRFRendererOutputs NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: RawToOutputs(
 	return result;
 }
 
+//Обрабатываем границы отражением
+inline torch::Tensor ReflectBoundary(torch::Tensor pts, torch::Tensor min_bound, torch::Tensor max_bound)
+{
+	//Приводим точки к диапазону [0,1]^3
+	auto normalized_pts = (pts - min_bound) / (max_bound - min_bound);
+
+	//Функция отражения для одного измерения
+	auto reflect_dim = [](torch::Tensor x) {
+		x = torch::fmod(x, 2.0f);
+		auto mask = x > 1.0f;
+		return torch::where(mask, 2.0f - x, x);
+	};
+
+	//Применяем отражение по всем измерениям
+	auto x = reflect_dim(normalized_pts.index({ "...", 0 }));
+	auto y = reflect_dim(normalized_pts.index({ "...", 1 }));
+	auto z = reflect_dim(normalized_pts.index({ "...", 2 }));
+
+	auto reflected = torch::stack({ x, y, z }, -1);
+	return reflected * (max_bound - min_bound) + min_bound;
+}
 
 ///Volumetric rendering.
 template <class TEmbedder, class TEmbedDirs, class TNeRF>
@@ -222,7 +250,9 @@ NeRFRenderResult NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: RenderRays(
 	const float perturb /*= 0.f*/,							///0. or 1. If non - zero, each ray is sampled at stratified random points in time.
 	const int n_importance /*= 0*/,							///Number of additional times to sample along each ray.
 	const bool white_bkgr /*= false*/,					///If True, assume a white background.
-	const float raw_noise_std /*= 0.*/,
+	const float raw_noise_std /*= 0.f*/,
+	const float stochastic_preconditioning_alpha /*= 0.f*/,
+	torch::Tensor bounding_box /* = torch::Tensor()*/,
 	const bool return_weights /*= true*/
 ) {
 	torch::Device device = ray_batch.device();		//Передать параметром??
@@ -234,9 +264,9 @@ NeRFRenderResult NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: RenderRays(
 	torch::Tensor viewdirs;
 	if (ray_batch.sizes().back() > 8)
 		viewdirs = ray_batch.index({ torch::indexing::Slice(), torch::indexing::Slice(-3, torch::indexing::None) });
-	auto bounds = torch::reshape(ray_batch.index({ "...", torch::indexing::Slice(6, 8) }), { -1, 1, 2 });
-	auto near = bounds.index({ "...", 0 });
-	auto far = bounds.index({ "...", 1 }); //[-1, 1
+	auto ray_bounds = torch::reshape(ray_batch.index({ "...", torch::indexing::Slice(6, 8) }), { -1, 1, 2 });
+	auto near = ray_bounds.index({ "...", 0 });
+	auto far = ray_bounds.index({ "...", 1 }); //[-1, 1
 
 	torch::Tensor t_vals = torch::linspace(0.f, 1.f, n_samples, torch::kFloat).to(device);
 	torch::Tensor z_vals;
@@ -273,6 +303,17 @@ NeRFRenderResult NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: RenderRays(
 		std::tie(z_vals, z_indices) = torch::sort(torch::cat({ z_vals, z_samples }, -1), -1);
 		pts = rays_o.index({ "...", torch::indexing::None, torch::indexing::Slice() }) + rays_d.index({ "...", torch::indexing::None, torch::indexing::Slice() }) * z_vals.index({ "...", torch::indexing::Slice(), torch::indexing::None }); // [N_rays, N_samples + N_importance, 3]
 		
+		//Применяем стохастическое предобуславливание
+		if (stochastic_preconditioning_alpha > 0.0f)
+		{
+			std::vector<torch::Tensor> bounds = torch::split(bounding_box, { 3, 3 }, -1);
+			auto min_bound = bounds[0].to(device);
+			auto max_bound = bounds[1].to(device);
+			auto noise =  torch::randn_like(pts) * stochastic_preconditioning_alpha;
+			pts = pts + noise.to(device);
+			pts = ReflectBoundary(pts, min_bound, max_bound);	//Обрабатываем границы отражением
+		}
+
 		if (!NetworkFine /*!= nullptr*/)
 		{
 			raw = RunNetwork(pts, viewdirs, NeRF, EmbedFn, EmbeddirsFn);
@@ -308,6 +349,8 @@ NeRFRenderResult NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: BatchifyRays(
 	const int n_importance /*= 0*/,							///Number of additional times to sample along each ray.
 	const bool white_bkgr /*= false*/,					///If True, assume a white background.
 	const float raw_noise_std /*= 0.*/,
+	const float stochastic_preconditioning_alpha /*= 0.f*/,
+	torch::Tensor bounding_box /* = torch::Tensor()*/,
 	const bool return_weights /*= true*/
 ) {
 	NeRFRenderResult result;
@@ -324,6 +367,8 @@ NeRFRenderResult NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: BatchifyRays(
 			n_importance,
 			white_bkgr,
 			raw_noise_std,
+			stochastic_preconditioning_alpha,
+			bounding_box,
 			return_weights
 		));
 	}
@@ -426,7 +471,7 @@ NeRFRenderResult NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: Render(
 	//Renderand reshape
 	NeRFRenderResult all_ret = std::move(BatchifyRays(
 		rays_, render_params.NSamples, render_params.Chunk, render_params.ReturnRaw, render_params.LinDisp, render_params.Perturb,
-		render_params.NImportance, render_params.WhiteBkgr, render_params.RawNoiseStd, render_params.ReturnWeights
+		render_params.NImportance, render_params.WhiteBkgr, render_params.RawNoiseStd, render_params.StochasticPreconditioningAlpha, render_params.BoundingBox, render_params.ReturnWeights
 	));
 
 	if (all_ret.Outputs1.RGBMap.numel() != 0)

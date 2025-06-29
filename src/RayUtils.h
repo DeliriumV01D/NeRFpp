@@ -6,14 +6,14 @@ inline torch::Tensor GetDirections(const int h, const int w, torch::Tensor k)
 {
 	const auto device = k.device();
 	const auto options = torch::TensorOptions().device(device);
-	//Создаем сетку на целевом устройстве (без транспонирования)
+	//РЎРѕР·РґР°РµРј СЃРµС‚РєСѓ РЅР° С†РµР»РµРІРѕРј СѓСЃС‚СЂРѕР№СЃС‚РІРµ (Р±РµР· С‚СЂР°РЅСЃРїРѕРЅРёСЂРѕРІР°РЅРёСЏ)
 	auto y_range = torch::linspace(0, h - 1, h, options).view({ h, 1 }).expand({ h, w });
 	auto x_range = torch::linspace(0, w - 1, w, options).view({ 1, w }).expand({ h, w });
 	const auto fx = k[0][0];
 	const auto cx = k[0][2];
 	const auto fy = k[1][1];
 	const auto cy = k[1][2];
-	//Вычисляем направления (векторизованные операции)
+	//Р’С‹С‡РёСЃР»СЏРµРј РЅР°РїСЂР°РІР»РµРЅРёСЏ (РІРµРєС‚РѕСЂРёР·РѕРІР°РЅРЅС‹Рµ РѕРїРµСЂР°С†РёРё)
 	auto dir_x = (x_range - cx) / fx;
 	auto dir_y = -(y_range - cy) / fy;
 	auto dir_z = -torch::ones_like(x_range);

@@ -180,6 +180,21 @@ struct CompactData {
 	}
 };		//CompactData
 
+inline std::pair<float, float> GetBoundsForObj(const CompactData &data)
+{
+	torch::Tensor min_bound = torch::tensor({ 1e8f, 1e8f, 1e8f }),
+		max_bound = torch::tensor({ -1e8f, -1e8f, -1e8f });
+	auto bbox_diag = torch::norm(max_bound - min_bound).item<float>();
+	for (auto c2w = data.Poses.begin(); c2w != std::next(data.Poses.begin(), data.SplitsIdx[0]); c2w++)
+	{
+		auto rays_o = (*c2w).index({ torch::indexing::Slice(torch::indexing::None, 3), -1 })/*.expand(rays_d.sizes())*/;
+		min_bound = torch::min(min_bound, rays_o);
+		max_bound = torch::max(max_bound, rays_o);
+	}
+	float d = torch::norm(max_bound - min_bound).item<float>();
+	return std::pair<float, float>(0.15*d, 0.6*d);
+}
+
 ///BoundingBox calculation
 inline torch::Tensor GetBbox3dForObj(const CompactData &data) 
 {
@@ -214,8 +229,13 @@ inline torch::Tensor GetBbox3dForObj(const CompactData &data)
 	return torch::cat({ min_bound, max_bound }, -1);
 }
 
-inline CompactData load_blender_data(const std::filesystem::path &basedir, const bool half_res = false, const bool testskip = true)
-{
+inline CompactData load_blender_data(
+	const std::filesystem::path &basedir,
+	const float near = 0.f,
+	const float far = 0.f,
+	const bool half_res = false,
+	const bool testskip = true
+){
 	using json = nlohmann::json;
 	CompactData result;
 	//std::vector<torch::Tensor> img_vec,
@@ -281,13 +301,15 @@ inline CompactData load_blender_data(const std::filesystem::path &basedir, const
 		result.W = result.W / 2;
 		result.Focal = result.Focal / 2;
 	}
-	result.Near = 2.f;
-	result.Far = 6.f;
+
 	float kdata[] = { result.Focal, 0, 0.5f * result.W,
 		0, result.Focal, 0.5f * result.H,
 		0, 0, 1 };
 	result.K = torch::from_blob(kdata, { 3, 3 }, torch::kFloat32);
 	//result.K = GetCalibrationMatrix(result.Focal, result.W, result.H);
+	auto bounds = near == 0.f || far == 0.f ? GetBoundsForObj(result) : std::pair<float, float>(0.f, 0.f);		///!!!Можно придумать что-то поизящнее чем просто найти максимальную дистанцию между камерами, например, привязаться к параметрам камеры, затем построить грубую сцену и переопределить параметры
+	result.Near = (near == 0) ? bounds.first : near;
+	result.Far = (far == 0) ? bounds.second : far;
 	result.BoundingBox = GetBbox3dForObj(result);		//(train_poses, result.H, result.W, /*near =*/ 2.0f, /*far =*/ 6.0f);
 	return result;
 }

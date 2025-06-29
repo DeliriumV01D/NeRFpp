@@ -66,10 +66,11 @@ protected:
 
 	///Transforms model's predictions to semantically meaningful values.
 	virtual LeRFRendererOutputs RawToLEOutputs(
-		torch::Tensor raw,			///raw : [num_rays, num_samples along ray, 4+3+(3)] .Prediction from model.
-		torch::Tensor z_vals,		///z_vals : [num_rays, num_samples along ray] .Integration time.
+		torch::Tensor raw_le,			///raw : [num_rays, num_samples along ray, 4+3+(3)] .Prediction from model.
+		torch::Tensor z_vals_le,		///z_vals : [num_rays, num_samples along ray] .Integration time.
 		torch::Tensor rays_d,		///rays_d : [num_rays, 3] .Direction of each ray.
-		const int lang_embed_dim = 768
+		const int lang_embed_dim = 768,
+		const float raw_noise_std = 0.f
 	);
 
 public:

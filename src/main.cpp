@@ -184,7 +184,7 @@ int main(int argc, const char* argv[])
 	exparams.calculate_normals = false;
 	exparams.use_pred_normal = false;	//whether to use predicted normals
 	exparams.use_lerf = false;				//use language embedded radiance fields
-	exparams.multires_views = 7;		//log2 of max freq for positional encoding (2D direction)
+	exparams.multires_views = 8;		//log2 of max freq for positional encoding (2D direction)
 	exparams.n_importance = 192;//192;		//number of additional fine samples per ray
 	exparams.net_depth_fine = 2;		//layers in fine network 8 for classic NeRF, 2/3 for HashNeRF
 	exparams.net_width_fine = 64;		//channels per layer in fine network 256 for classic NeRF, 64 for HashNeRF
@@ -227,14 +227,13 @@ int main(int argc, const char* argv[])
 	params.RenderOnly = false;			//do not optimize, reload weights and render out render_poses path
 	params.Ndc = false;							//use normalized device coordinates (set for non-forward facing scenes)
 	params.LinDisp = false;					//sampling linearly in disparity rather than depth
-	params.NoBatching = true;				//only take random rays from 1 image at a time
 	params.TestSkip = false;
 	params.Chunk = 1024 * (exparams.use_lerf ? 1 : 4);				//number of rays processed in parallel, decrease if running out of memory <= NRand
 	params.NSamples = 64;						//number of coarse samples per ray
 	params.NRand = 32 * 32 * (exparams.use_lerf ? 1 : 16);		//batch size (number of random rays per gradient step), decrease if running out of memory >= Chunk, n*Chunk
 	params.PrecorpIters = 0;				//number of steps to train on central crops
 	params.NIters = 6100;
-	params.LRateDecay = 3;				//exponential learning rate decay (in 1000 steps)  например: 150 - каждые 150000 итераций скорость обучения будет падать в 10 раз
+	params.LRateDecay = 4;				//exponential learning rate decay (in 1000 steps)  например: 150 - каждые 150000 итераций скорость обучения будет падать в 10 раз
 	//logging / saving options
 	params.IPrint = 100;						//frequency of console printout and metric loggin
 	params.IImg = 500;							//frequency of tensorboard image logging

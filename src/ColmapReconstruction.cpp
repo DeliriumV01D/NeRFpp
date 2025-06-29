@@ -324,13 +324,14 @@ CompactData LoadFromColmapReconstruction( const std::filesystem::path &workspace
 	}
 
 	//!!!
-	result.Near = 2.f;
-	result.Far = 6.f;
 	float kdata[] = { result.Focal, 0, 0.5f * result.W,
 		0, result.Focal, 0.5f * result.H,
 		0, 0, 1 };
 	result.K = torch::from_blob(kdata, { 3, 3 }, torch::kFloat32);
 	//result.K = GetCalibrationMatrix(result.Focal, result.W, result.H);
+	auto bounds = GetBoundsForObj(result);			///!!!Можно придумать что-то поизящнее чем просто найти максимальную дистанцию между камерами, например, привязаться к параметрам камеры, оценить из имеющейся разреженной реконструкции
+	result.Near = bounds.first;
+	result.Far = bounds.second;
 	result.BoundingBox = GetBbox3dForObj(result);		//(train_poses, result.H, result.W, /*near =*/ 2.0f, /*far =*/ 6.0f);
 	return result;
 }

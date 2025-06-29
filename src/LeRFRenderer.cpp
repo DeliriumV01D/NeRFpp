@@ -29,7 +29,8 @@ LeRFRendererOutputs LeRFRenderer :: RawToLEOutputs(
 	torch::Tensor raw_le,			///raw : [num_rays, num_samples along ray, 4+3+(3)] .Prediction from model.
 	torch::Tensor z_vals_le,		///z_vals : [num_rays, num_samples along ray] .Integration time.
 	torch::Tensor rays_d,			///rays_d : [num_rays, 3] .Direction of each ray.
-	const int lang_embed_dim /*= 768*/
+	const int lang_embed_dim /*= 768*/,
+	const float raw_noise_std /*= 0.*/
 ) {
 	torch::Device device = raw_le.device();
 	LeRFRendererOutputs result;
@@ -47,6 +48,10 @@ LeRFRendererOutputs LeRFRenderer :: RawToLEOutputs(
 	cur_pos += lang_embed_dim;
 		
 	auto le_density_before_activation = raw_le.index({ "...", cur_pos});		//    извлекает значения (sigma_le) очередного столбца raw
+	if (raw_noise_std > 0.f)
+	{
+		le_density_before_activation = le_density_before_activation + torch::randn_like(le_density_before_activation) * raw_noise_std;
+	}	
 	torch::Tensor le_alpha = raw2alpha(le_density_before_activation, dists_le);  //[N_rays, N_samples]
 	result.WeightsLE = le_alpha * torch::cumprod(
 			torch::cat({ torch::ones({le_alpha.sizes()[0], 1}).to(device), -le_alpha + 1.f + 1e-10f }, -1),
@@ -116,7 +121,7 @@ LeRFRenderResult LeRFRenderer :: RenderRays(
 
 	auto pts = rays_o.index({ "...", torch::indexing::None, torch::indexing::Slice() }) + rays_d.index({ "...", torch::indexing::None, torch::indexing::Slice() }) * z_vals.index({ "...", torch::indexing::Slice(), torch::indexing::None}); //[N_rays, N_samples, 3]
 	torch::Tensor raw =  RunLENetwork(pts, Lerf, LangEmbedFn);
-	lerf_result.Outputs1 = RawToLEOutputs(raw, z_vals, rays_d, Lerf->GetLangEmbedDim());
+	lerf_result.Outputs1 = RawToLEOutputs(raw, z_vals, rays_d, Lerf->GetLangEmbedDim(), raw_noise_std);
 
 	if (n_importance > 0)
 	{
@@ -134,7 +139,7 @@ LeRFRenderResult LeRFRenderer :: RenderRays(
 		}	else {
 			raw = RunLENetwork(pts, LerfFine, LangEmbedFn);
 		}
-		lerf_result.Outputs1 = RawToLEOutputs(raw, z_vals, rays_d, Lerf->GetLangEmbedDim());
+		lerf_result.Outputs1 = RawToLEOutputs(raw, z_vals, rays_d, Lerf->GetLangEmbedDim(), raw_noise_std);
 		//result.ZStd = torch::std(z_samples, -1, false);  // [N_rays]
 	}
 
