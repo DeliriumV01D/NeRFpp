@@ -287,7 +287,7 @@ inline CompactData LoadData (
 	if (dataset_type == DatasetType::BLENDER)
 	{
 		dataset_type_str = "BLENDER";
-		data = load_blender_data(basedir, half_res, test_skip);
+		data = load_blender_data(basedir, 0.f, 0.f, half_res, test_skip);
 		//!!!Тут K and BoundingBox поломано, поэтому ниже все повторно заполняется
 	}
 
@@ -757,6 +757,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 		focal = focal / rparams.RenderFactor;
 	}
 
+
 	for (size_t i = 0; i < render_poses.size(); i++)		//(auto &c2w : render_poses) //
 	{
 		if (Params.use_nerf)
@@ -783,30 +784,20 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 
 		if (Params.use_lerf)
 		{
-			auto render_result = std::move(LeRFRenderer->Render(h, w, k,
-				rparams,
-				rays,
-				render_poses[i].index({ torch::indexing::Slice(torch::indexing::None, 3), torch::indexing::Slice(torch::indexing::None, 4) }),
-				c2w_staticcam
-			));
+			auto render_result = std::move(LeRFRenderer->Render(h, w, k, rparams, rays, render_poses[i].index({ torch::indexing::Slice(torch::indexing::None, 3),
+															torch::indexing::Slice(torch::indexing::None, 4) }), c2w_staticcam));
+
 			if (!savedir.empty())
 			{
-				//!!!визуализацию similarity с каким-нибудь словом относительно случайного набора (см статью и код)
-				cv::Mat relevancy_img(h, w, CV_8UC1/*CV_32FC1*/);
-				torch::Tensor rel = render_result.Outputs1.Relevancy.cpu();
-				#pragma omp parallel for
-				for (int i = 0; i < w; i++)
-					for (int j = 0; j < h; j++)
-					{
-						float lv = rel.index({j,i,0}).item<float>();
-						relevancy_img.at<uchar>(j, i) = cv::saturate_cast<uchar>((lv>0.7?lv:0) * 255);	//[-1..1] -> [0..255]
-						//relevancy_img.at<float>(j, i) = /*cv::saturate_cast<uchar>(*/lv/*(lv>0.5?lv:0)*/ /** 255*/;	//[-1..1] -> [0..255]
-					}
-				//cv::normalize(relevancy_img, relevancy_img, 0, 255, cv::NORM_MINMAX);
-				//relevancy_img.convertTo(relevancy_img, CV_8UC1);
-				cv::imwrite((savedir / ("rendered_lang_embedding" + std::to_string(i) + ".png")).string(), relevancy_img);
-			}	//if savedir
-		}	//if use_lerf
+				torch::Tensor rel = render_result.Outputs1.Relevancy.reshape({ h, w, 2 });
+				torch::Tensor pos_probs = rel.index({ "...", 0 });  // [H, W]
+				pos_probs = pos_probs.mul(255).to(torch::kU8).cpu();
+				cv::Mat relevancy_img(h, w, CV_8UC1, pos_probs.data_ptr());
+				cv::Mat colored_map;
+				cv::applyColorMap(relevancy_img, colored_map, cv::COLORMAP_JET);
+				cv::imwrite((savedir / ("relevancy_" + std::to_string(i) + ".png")).string(), colored_map);
+			}
+		}
 
 		//if (Params.use_nerfactor)
 		//{
@@ -860,68 +851,75 @@ template <typename TEmbedder, typename TEmbedDirs, typename TNeRF, typename TNeR
 typename TLeRFEmbedder, typename TLeRF, typename TLeRFRenderer>
 void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, TLeRF, TLeRFRenderer> :: InitializePyramidClipEmbedding(const NeRFExecutorTrainParams &params, const CompactData &data, bool test /*= false*/)
 {
-	if (Params.use_lerf)
-	{
-		PyramidEmbedderProperties pyramid_embedder_properties; 
-		pyramid_embedder_properties.ImgSize = {Params.clip_input_img_size, Params.clip_input_img_size};	//Входной размер изображения сети
-		pyramid_embedder_properties.Overlap = Params.pyr_embedder_overlap;										///Доля перекрытия
-		///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0 , 1, 2...
-		pyramid_embedder_properties.MaxZoomOut = std::min(log2f(data.W/Params.clip_input_img_size), log2f(data.H/Params.clip_input_img_size));
-		PyramidEmbedder PyramidClipEmbedder(Clip, ClipProcessor, pyramid_embedder_properties);
-
-		if (!std::filesystem::exists(params.PyramidClipEmbeddingSaveDir/"pyramid_embeddings.pt"))
+	try {
+		if (Params.use_lerf)
 		{
-			std::cout << "calculating pyramid embeddings..." << std::endl;
-			///Разбить на патчи с перекрытием  +  парочку масштабов (zoomout) и кэшировать эмбеддинги от них
-			PyramidClipEmbedding = PyramidClipEmbedder(data);
-			PyramidClipEmbedding.Save(params.PyramidClipEmbeddingSaveDir/"pyramid_embeddings.pt");
-		} else {
-			std::cout << "loading pyramid embeddings..." << std::endl;
-			PyramidClipEmbedding.Load(params.PyramidClipEmbeddingSaveDir/"pyramid_embeddings.pt");
+			PyramidEmbedderProperties pyramid_embedder_properties;
+			pyramid_embedder_properties.ImgSize = { Params.clip_input_img_size, Params.clip_input_img_size };	//Входной размер изображения сети
+			pyramid_embedder_properties.Overlap = Params.pyr_embedder_overlap;										///Доля перекрытия
+			///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0 , 1, 2...
+			pyramid_embedder_properties.MaxZoomOut = std::min(log2f(data.W / Params.clip_input_img_size), log2f(data.H / Params.clip_input_img_size));
+			PyramidEmbedder PyramidClipEmbedder(Clip, ClipProcessor, pyramid_embedder_properties);
+
+			if (!std::filesystem::exists(params.PyramidClipEmbeddingSaveDir / "pyramid_embeddings.pt"))
+			{
+				std::cout << "calculating pyramid embeddings..." << std::endl;
+				///Разбить на патчи с перекрытием  +  парочку масштабов (zoomout) и кэшировать эмбеддинги от них
+				PyramidClipEmbedding = PyramidClipEmbedder(data);
+				PyramidClipEmbedding.Save(params.PyramidClipEmbeddingSaveDir / "pyramid_embeddings.pt");
+			}
+			else {
+				std::cout << "loading pyramid embeddings..." << std::endl;
+				PyramidClipEmbedding.Load(params.PyramidClipEmbeddingSaveDir / "pyramid_embeddings.pt");
+			}
+
+			SetLeRFPrompts(Params.lerf_positives, Params.lerf_negatives);
 		}
 
-		SetLeRFPrompts(Params.lerf_positives, Params.lerf_negatives);
-	}
+		if (Params.use_lerf && test)
+		{
+			std::cout << "lang embedding visualization test..." << std::endl;
+			//test
+			PyramidEmbedderProperties pyramid_embedder_properties;
+			pyramid_embedder_properties.ImgSize = { Params.clip_input_img_size, Params.clip_input_img_size };	//Входной размер изображения сети
+			pyramid_embedder_properties.Overlap = Params.pyr_embedder_overlap;										///Доля перекрытия
+			///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0 , 1, 2...
+			pyramid_embedder_properties.MaxZoomOut = std::min(log2f(data.W / Params.clip_input_img_size), log2f(data.H / Params.clip_input_img_size));
+			//auto scale = Clip->GetLogitScale().exp().to(torch::kCPU);
 
-	if (Params.use_lerf && test) 
-	{
-		std::cout<<"lang embedding visualization test..."<<std::endl;
-		//test
-		PyramidEmbedderProperties pyramid_embedder_properties; 
-		pyramid_embedder_properties.ImgSize = {Params.clip_input_img_size, Params.clip_input_img_size};	//Входной размер изображения сети
-		pyramid_embedder_properties.Overlap = Params.pyr_embedder_overlap;										///Доля перекрытия
-		///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0 , 1, 2...
-		pyramid_embedder_properties.MaxZoomOut = std::min(log2f(data.W/Params.clip_input_img_size), log2f(data.H/Params.clip_input_img_size));
-		//auto scale = Clip->GetLogitScale().exp().to(torch::kCPU);
+			int img_id = 0;
 
-		int img_id = 50;
+			//!!!В этом месте можно распараллелить через выполнение батчами на GPU
+			//!Объединив несколько cat({image_features1..image_featuresТ})
+			cv::Mat test_img(data.H, data.W, CV_8UC1);
+			auto [lerf_positives, lerf_negatives] = LeRFRenderer->GetLeRFPrompts();
+			#pragma omp parallel for
+			for (int i = 0; i < data.W; i++)
+				for (int j = 0; j < data.H; j++)
+				{
+					torch::Tensor image_features = PyramidClipEmbedding.GetPixelValue(i, j, 0.5f, img_id, pyramid_embedder_properties, cv::Size(data.W, data.H)).to(torch::kCPU);
+					//Уже нормировано при вычислении пирамиды normalize features???
+					//image_features = image_features / image_features.norm(2/*L2*/, -1, true);
+					//output = torch::nn::functional::normalize(output, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8));
 
-		//!!!В этом месте можно распараллелить через выполнение батчами на GPU
-		//!Объединив несколько cat({image_features1..image_featuresТ})
-		cv::Mat test_img(data.H, data.W, CV_8UC1);
-		#pragma omp parallel for
-		for (int i = 0; i < data.W; i++)
-			for (int j = 0; j < data.H; j++)
-			{
-				torch::Tensor image_features = PyramidClipEmbedding.GetPixelValue(i,j,0.5f,img_id,pyramid_embedder_properties,cv::Size(data.W, data.H)).to(torch::kCPU);
-				//Уже нормировано при вычислении пирамиды normalize features???
-				//image_features = image_features / image_features.norm(2/*L2*/, -1, true);
-				//output = torch::nn::functional::normalize(output, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8));
-				
-				////cosine similarity as logits
-				//auto logits = /*scale * */torch::mm(image_features, LerfPositives.t());
-				//float lv = (logits[0,0].item<float>()/*/scale*/ + 1)/2;
-				//test_img.at<uchar>(j, i) = cv::saturate_cast<uchar>(/*(lv>0.5?lv:0)*/lv * 125);	//[-1..1] -> [0..255]
+					////cosine similarity as logits
+					//auto logits = /*scale * */torch::mm(image_features, LerfPositives.t());
+					//float lv = (logits[0,0].item<float>()/*/scale*/ + 1)/2;
+					//test_img.at<uchar>(j, i) = cv::saturate_cast<uchar>(/*(lv>0.5?lv:0)*/lv * 125);	//[-1..1] -> [0..255]
 
-				//relevancy
-				auto [lerf_positives, lerf_negatives] = LeRFRenderer->GetLeRFPrompts();
-				torch::Tensor rel = Relevancy(image_features, lerf_positives, lerf_negatives);
-				float lv = rel.index({0,0}).item<float>();
-				test_img.at<uchar>(j, i) = cv::saturate_cast<uchar>((lv>0.7?lv:0) * 255);	//[-1..1] -> [0..255]
-			}
-		cv::imshow("img", TorchTensorToCVMat(data.Imgs[img_id]));
-		cv::imshow("test_img", test_img);
-		cv::waitKey(1);
+					//relevancy
+					torch::Tensor rel = Relevancy(image_features, lerf_positives, lerf_negatives);
+					float lv = rel.index({ 0,0 }).item<float>();
+					test_img.at<uchar>(j, i) = cv::saturate_cast<uchar>(lv * 255);	//[-1..1] -> [0..255]
+				}
+			cv::imshow("img", TorchTensorToCVMat(data.Imgs[img_id]));
+			cv::Mat colored_map;
+			cv::applyColorMap(test_img, colored_map, cv::COLORMAP_JET);
+			cv::imshow("test_img", colored_map);
+			cv::waitKey(1);
+		}
+	} catch (std::exception& e) {
+		std::cout << e.what() << std::endl;
 	}
 }
 

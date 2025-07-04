@@ -7,7 +7,7 @@ torch::Tensor LeRFRenderer :: RunLENetwork(torch::Tensor inputs, LeRF lerf, CuHa
 	//return NeRFRenderer :: RunNetwork(inputs,	torch::Tensor(), lerf, lang_embed_fn, nullptr);
 
 	//можно попробовать научить работать эмбедер с батчами чтобы не плющить тензоры?
-	torch::Tensor inputs_flat = torch::reshape(inputs, { -1, inputs.sizes().back()/*[-1]*/ });  //[1024, 256, 3] -> [262144, 3]
+	torch::Tensor inputs_flat = inputs.view({ -1, inputs.sizes().back()/*[-1]*/ });  //[1024, 256, 3] -> [262144, 3]
 	inputs_flat.set_requires_grad(false);
 	auto [embedded, keep_mask] = lang_embed_fn->forward(inputs_flat); 
 
@@ -20,8 +20,7 @@ torch::Tensor LeRFRenderer :: RunLENetwork(torch::Tensor inputs, LeRF lerf, CuHa
 	std::vector<int64_t> sz = inputs.sizes().vec();
 	sz.pop_back();
 	sz.push_back(outputs_flat.sizes().back());
-	torch::Tensor outputs = torch::reshape(outputs_flat, sz);  //list(inputs.shape[:-1]) + [outputs_flat.shape[-1]]  //[262144, 5] -> [1024, 256, 5]
-	return outputs;
+	return outputs_flat.view(sz);  //list(inputs.shape[:-1]) + [outputs_flat.shape[-1]]  //[262144, 5] -> [1024, 256, 5]
 }
 
 ///Transforms model's predictions to semantically meaningful values.
@@ -80,7 +79,9 @@ LeRFRenderResult LeRFRenderer :: RenderRays(
 	const float perturb /*= 0.f*/,							///0. or 1. If non - zero, each ray is sampled at stratified random points in time.
 	const int n_importance /*= 0*/,							///Number of additional times to sample along each ray.
 	const bool white_bkgr /*= false*/,					///If True, assume a white background.
-	const float raw_noise_std /*= 0.*/,
+	const float raw_noise_std /*= 0.f*/,				///Локальная регуляризация плотности (выход) помогает избежать артефактов типа "облаков" затухает за n_iters / 3 итераций
+	const float stochastic_preconditioning_alpha /*= 0.f*/,///добавляет шум к входу сети (координатам точек). Уменьшает чувствительность к инициализации. Помогает избежать "плавающих" артефактов
+	torch::Tensor bounding_box /*= torch::Tensor()*/,
 	//const int lang_embed_dim /*= 768*/,
 	const bool return_weights /*= true*/
 ){
@@ -94,9 +95,9 @@ LeRFRenderResult LeRFRenderer :: RenderRays(
 	torch::Tensor viewdirs;
 	if (ray_batch.sizes().back() > 8)
 		viewdirs = ray_batch.index({ torch::indexing::Slice(), torch::indexing::Slice(-3, torch::indexing::None) });
-	auto bounds = torch::reshape(ray_batch.index({ "...", torch::indexing::Slice(6, 8) }), { -1, 1, 2 });
-	auto near = bounds.index({ "...", 0 });
-	auto far = bounds.index({ "...", 1 }); //[-1, 1
+	auto ray_bounds = torch::reshape(ray_batch.index({ "...", torch::indexing::Slice(6, 8) }), { -1, 1, 2 });
+	auto near = ray_bounds.index({ "...", 0 });
+	auto far = ray_bounds.index({ "...", 1 }); //[-1, 1
 
 	torch::Tensor t_vals = torch::linspace(0.f, 1.f, n_samples, torch::kFloat).to(device);
 	torch::Tensor z_vals;
@@ -133,6 +134,17 @@ LeRFRenderResult LeRFRenderer :: RenderRays(
 		std::tie(z_vals, z_indices) = torch::sort(torch::cat({ z_vals, z_samples }, -1), -1);
 		pts = rays_o.index({ "...", torch::indexing::None, torch::indexing::Slice() }) + rays_d.index({ "...", torch::indexing::None, torch::indexing::Slice() }) * z_vals.index({ "...", torch::indexing::Slice(), torch::indexing::None }); // [N_rays, N_samples + N_importance, 3]
 		
+		//Применяем стохастическое предобуславливание
+		if (stochastic_preconditioning_alpha > 0.0f)
+		{
+			std::vector<torch::Tensor> bounds = torch::split(bounding_box, { 3, 3 }, -1);
+			auto min_bound = bounds[0].to(device);
+			auto max_bound = bounds[1].to(device);
+			auto noise = torch::randn_like(pts) * stochastic_preconditioning_alpha;
+			pts = pts + noise.to(device);
+			pts = ReflectBoundary(pts, min_bound, max_bound);	//Обрабатываем границы отражением
+		}
+
 		if (!LerfFine /*!= nullptr*/)
 		{
 			raw = RunLENetwork(pts, Lerf, LangEmbedFn);
@@ -171,6 +183,8 @@ LeRFRenderResult LeRFRenderer :: BatchifyRays(
 	const int n_importance /*= 0*/,							///Number of additional times to sample along each ray.
 	const bool white_bkgr /*= false*/,					///If True, assume a white background.
 	const float raw_noise_std /*= 0.*/,
+	const float stochastic_preconditioning_alpha /*= 0.f*/,
+	torch::Tensor bounding_box /* = torch::Tensor()*/,
 	const bool return_weights /*= true*/
 ) {
 	LeRFRenderResult result;
@@ -187,6 +201,8 @@ LeRFRenderResult LeRFRenderer :: BatchifyRays(
 			n_importance,
 			white_bkgr,
 			raw_noise_std,
+			stochastic_preconditioning_alpha,
+			bounding_box,
 			return_weights
 		));
 	}
@@ -283,7 +299,7 @@ LeRFRenderResult LeRFRenderer :: Render(
 	LeRFRenderResult all_ret = std::move(BatchifyRays(
 		rays_, 
 		render_params.NSamples, render_params.Chunk, render_params.ReturnRaw, render_params.LinDisp, render_params.Perturb,
-		render_params.NImportance, render_params.WhiteBkgr, render_params.RawNoiseStd, render_params.ReturnWeights
+		render_params.NImportance, render_params.WhiteBkgr, render_params.RawNoiseStd, render_params.StochasticPreconditioningAlpha, render_params.BoundingBox, render_params.ReturnWeights
 	));
 
 	if (sh.size() > 2)			//не [4096, 3] а [800,800,3]

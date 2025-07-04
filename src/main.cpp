@@ -160,7 +160,7 @@ const std::string DATA_DIR = "..//data//nerf_synthetic//drums";
 //
 //	std::cout << "params count: " << Trainable::ParamsCount(nerf) << std::endl;
 //
-//	auto cd = load_blender_data(DATA_DIR, false, true);
+//	auto cd = load_blender_data(DATA_DIR, 0.f, 0.f, false, true);
 //	for (auto it : cd.Splits)
 //		std::cout << it << std::endl;
 //
@@ -186,7 +186,7 @@ int main(int argc, const char* argv[])
 	exparams.use_lerf = false;				//use language embedded radiance fields
 	exparams.multires_views = 8;		//log2 of max freq for positional encoding (2D direction)
 	exparams.n_importance = 192;//192;		//number of additional fine samples per ray
-	exparams.net_depth_fine = 2;		//layers in fine network 8 for classic NeRF, 2/3 for HashNeRF
+	exparams.net_depth_fine = 3;		//layers in fine network 8 for classic NeRF, 2/3 for HashNeRF
 	exparams.net_width_fine = 64;		//channels per layer in fine network 256 for classic NeRF, 64 for HashNeRF
 	exparams.num_layers_color = 2;				//for color part of the HashNeRF
 	exparams.hidden_dim_color = 64;			//for color part of the HashNeRF

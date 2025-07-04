@@ -95,7 +95,9 @@ public:
 		const float perturb = 0.f,							///0. or 1. If non - zero, each ray is sampled at stratified random points in time.
 		const int n_importance = 0,							///Number of additional times to sample along each ray.
 		const bool white_bkgr = false,					///If True, assume a white background.
-		const float raw_noise_std = 0.,
+		const float raw_noise_std = 0.f,				///Локальная регуляризация плотности (выход) помогает избежать артефактов типа "облаков" затухает за n_iters / 3 итераций
+		const float stochastic_preconditioning_alpha = 0.f,///добавляет шум к входу сети (координатам точек). Уменьшает чувствительность к инициализации. Помогает избежать "плавающих" артефактов
+		torch::Tensor bounding_box = torch::Tensor(),
 		//const int lang_embed_dim = 768,
 		const bool return_weights = true
 	);
@@ -112,6 +114,8 @@ public:
 		const int n_importance = 0,							///Number of additional times to sample along each ray.
 		const bool white_bkgr = false,					///If True, assume a white background.
 		const float raw_noise_std = 0.,
+		const float stochastic_preconditioning_alpha = 0.f,
+		torch::Tensor bounding_box = torch::Tensor(),
 		const bool return_weights = true
 	);
 
