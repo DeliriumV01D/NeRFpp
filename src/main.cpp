@@ -245,20 +245,14 @@ int main(int argc, const char* argv[])
 	params.PrecorpFrac = 0.5f;
 	params.PyramidClipEmbeddingSaveDir = DATA_DIR;			//
 
-	CompactData data = LoadData(DATA_DIR,
+	NeRFDatasetParams data = LoadDatasetParams(
+		DATA_DIR,
 		exparams.device,
 		DatasetType::BLENDER, 
 		false,			///load blender synthetic data at 400x400 instead of 800x800
 		params.TestSkip,
 		false				///set to render synthetic data on a white bkgd (always use for dvoxels)
 	);
-	///!!!Сделать нормальное копирование, так как эти тензоры заполняются внутри
-	float kdata[] = { data.Focal, 0, 0.5f * data.W,
-		0, data.Focal, 0.5f * data.H,
-		0, 0, 1 };
-	data.K = torch::from_blob(kdata, { 3, 3 }, torch::kFloat32);
-	//data.K = GetCalibrationMatrix(data.Focal, data.W, data.H).clone().detach();
-	data.BoundingBox = GetBbox3dForObj(data).clone().detach();
 
 	nerf_executor.Train(data, params);
 

@@ -338,7 +338,7 @@ std::pair <CLIP, std::shared_ptr<RuCLIPProcessor>> PyramidEmbedder :: Initialize
 
 
 ///Разбить на патчи с перекрытием  +  парочку масштабов (zoomout) и кэшировать эмбеддинги от них
-PyramidEmbedding PyramidEmbedder :: operator()(const CompactData &data)
+PyramidEmbedding PyramidEmbedder :: operator()(const NeRFDatasetParams &data)
 {
 	PyramidEmbedding result;
 
@@ -346,7 +346,8 @@ PyramidEmbedding PyramidEmbedder :: operator()(const CompactData &data)
 	HorPosIdx = 0;
 	VertPosIdx = 0;
 	DataImageIdx = 0;
-	DataImage = TorchTensorToCVMat(data.Imgs[DataImageIdx]);
+	DataImage = cv::imread(data.ImagePaths[DataImageIdx].string(), cv::IMREAD_COLOR/*cv::IMREAD_UNCHANGED*/);
+
 	while (true)
 	{
 		torch::NoGradGuard no_grad;
@@ -368,7 +369,7 @@ PyramidEmbedding PyramidEmbedder :: operator()(const CompactData &data)
 
 ///Получить очередной фрагмент изображения вместе с его индексами
 ///!!!Должно быть согласовано с GetNearestPatchCenters/Vertices
-std::tuple<int, int, int, int, cv::Mat> PyramidEmbedder :: GetNextSample(const CompactData &data)
+std::tuple<int, int, int, int, cv::Mat> PyramidEmbedder :: GetNextSample(const NeRFDatasetParams &data)
 {
 	cv::Mat sample;
 	cv::Rect window_rect;
@@ -381,10 +382,8 @@ std::tuple<int, int, int, int, cv::Mat> PyramidEmbedder :: GetNextSample(const C
 		window_rect.width = Properties.ImgSize.width * pow(2, ZoomOutIdx);
 		window_rect.height = Properties.ImgSize.height * pow(2, ZoomOutIdx);
 
-		int bs = data.Imgs[DataImageIdx].sizes()[0],
-			h = data.Imgs[DataImageIdx].sizes()[1],
-			w = data.Imgs[DataImageIdx].sizes()[2],
-			nch = data.Imgs[DataImageIdx].sizes()[3];
+		int h = data.H,
+			w = data.W;
 
 		int nw = static_cast<int>((w - window_rect.width * Properties.Overlap)/(window_rect.width * (1. - Properties.Overlap)));
 		int nh = static_cast<int>((h - window_rect.height * Properties.Overlap)/(window_rect.height * (1. - Properties.Overlap)));
@@ -440,8 +439,8 @@ std::tuple<int, int, int, int, cv::Mat> PyramidEmbedder :: GetNextSample(const C
 
 					//Цикл по сэмплам датасета
 					DataImageIdx++; //RandomInt() % data.Imgs.size();
-					if (DataImageIdx < data.Imgs.size())
-						DataImage = TorchTensorToCVMat(data.Imgs[DataImageIdx]);
+					if (DataImageIdx < data.ImagePaths.size())
+						DataImage = cv::imread(data.ImagePaths[DataImageIdx].string(), cv::IMREAD_COLOR/*cv::IMREAD_UNCHANGED*/);
 					else
 						DataImage = cv::Mat();
 				}

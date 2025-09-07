@@ -21,6 +21,8 @@ endif()
 
 set(SOURCES ${SOURCES}
 	src/LibTorchTraining/Trainable.cpp
+	src/CustomOps.cpp
+	src/CustomOps.cu
 	src/CuSHEncoder.cpp
 	src/CuSHEncoder.cu
 	src/CuHashEmbedder.cpp
@@ -39,6 +41,7 @@ set(SOURCES ${SOURCES}
 	src/NeRFactor.cpp
 	src/NeRFactorRenderer.cpp
 	src/ColmapReconstruction.cpp
+	src/NeRFDataset.cpp
 	src/main.cpp
 )
 
@@ -48,6 +51,7 @@ set(HEADERS ${HEADERS}
 	src/load_blender.h
 	src/LibTorchTraining/TorchHeader.h
 	src/LibTorchTraining/Trainable.h
+	src/CustomOps.h
 	src/BaseEmbedder.h
 	src/CuSHEncoder.h
 	src/CuHashEmbedder.h
@@ -67,6 +71,8 @@ set(HEADERS ${HEADERS}
 	src/NeRFactor.h
 	src/NeRFactorRenderer.h
 	src/ColmapReconstruction.h
+	src/NeRFDatasetParams.h
+	src/NeRFDataset.h
 )
 
 set(LIBS ${LIBS}

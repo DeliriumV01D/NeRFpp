@@ -273,7 +273,7 @@ struct NeRFExecutorTrainParams {
 };		//NeRFExecutorTrainParams
 
 
-inline CompactData LoadData (
+inline NeRFDatasetParams LoadDatasetParams (
 	const std::filesystem::path &basedir,
 	const torch::Device &device,
 	DatasetType dataset_type = DatasetType::BLENDER,
@@ -282,7 +282,7 @@ inline CompactData LoadData (
 	bool white_bkgr = false				///set to render synthetic data on a white bkgd (always use for dvoxels)
 )	{
 	std::string dataset_type_str;
-	CompactData data;
+	NeRFDatasetParams data;
 	//Загрузить данные
 	if (dataset_type == DatasetType::BLENDER)
 	{
@@ -297,29 +297,13 @@ inline CompactData LoadData (
 		data = LoadFromColmapReconstruction(basedir.string());
 	}
 
-	std::cout << "Loaded " << dataset_type_str << data.Imgs.size() << " " << data.RenderPoses.size() << " " << data.H << " " << data.W << " " << data.Focal << " " << basedir << std::endl;
-	if (!data.Imgs.empty())
-		std::cout << "data.Imgs[0]: " << data.Imgs[0].sizes() << " " << data.Imgs[0].device() << " " << data.Imgs[0].type() << std::endl;
+	std::cout << "Loaded " << dataset_type_str << data.ImagePaths.size() << " " << data.RenderPoses.size() << " " << data.H << " " << data.W << " " << data.Focal << " " << basedir << std::endl;
 	//i_train, i_val, i_test = i_split;
 
-	for (auto &img : data.Imgs)
-	{
-		if (white_bkgr)
-			img = img.index({ "...", torch::indexing::Slice(torch::indexing::None, 3) }) * img.index({ "...", torch::indexing::Slice(-1, torch::indexing::None) }) + (1. - img.index({ "...", torch::indexing::Slice(-1, torch::indexing::None) }));
-		else
-			img = img.index({ "...", torch::indexing::Slice(torch::indexing::None, 3) });
-	}
+	data.WhiteBgr = white_bkgr;
 
 	if (dataset_type == DatasetType::BLENDER)
 	{
-		///!!!Сделать нормальное копирование, так как эти тензоры заполняются внутри
-		float kdata[] = { data.Focal, 0, 0.5f * data.W,
-			0, data.Focal, 0.5f * data.H,
-			0, 0, 1 };
-		data.K = torch::from_blob(kdata, { 3, 3 }, torch::kFloat32);
-		//data.K = GetCalibrationMatrix(data.Focal, data.W, data.H).clone().detach();
-		data.BoundingBox = GetBbox3dForObj(data).clone().detach();
-		
 		//Move testing data to GPU
 		for (auto &it : data.RenderPoses)
 			it = it.to(device);
@@ -353,9 +337,7 @@ protected:
 	bool UseViewDirs;									//use full 5D input instead of 3D
 	CLIP Clip = nullptr;
 	std::shared_ptr<RuCLIPProcessor> ClipProcessor = nullptr;
-	PyramidEmbedding PyramidClipEmbedding;
-	//torch::Tensor LerfPositives,
-	//	LerfNegatives;
+
 public:
 	NeRFExecutor(const NeRFExecutorParams &params) : Params(params), Device(params.device), NImportance(params.n_importance), UseViewDirs(params.use_viewdirs), LearningRate(params.learning_rate){};
 	void Initialize(const NeRFExecutorParams &params, torch::Tensor bounding_box);
@@ -401,10 +383,10 @@ public:
 	void SetLeRFPrompts(torch::Tensor lerf_positives, torch::Tensor lerf_negatives);
 	std::tuple<torch::Tensor, torch::Tensor> GetLeRFPrompts();
 
-	void InitializePyramidClipEmbedding(const NeRFExecutorTrainParams &params, const CompactData &data, bool test = false);
+	void InitializeTestLeRF(const NeRFExecutorTrainParams &params, const NeRFDatasetParams &data, NeRFDataset &dataset, bool test = false);
 
 	///
-	void Train(const CompactData &data, NeRFExecutorTrainParams &params);
+	void Train(const NeRFDatasetParams &data, NeRFExecutorTrainParams &params);
 	void SaveCheckpoint(const std::filesystem::path &path, const int global_step /*= 0*/);
 	NeRFExecutorParams GetParams(){return Params;};
 	torch::Tensor GetEmbedderBoundingBox(){return ExecutorEmbedder->GetBoundingBox();};
@@ -849,29 +831,11 @@ std::tuple<torch::Tensor, torch::Tensor> NeRFExecutor <TEmbedder, TEmbedDirs, TN
 
 template <typename TEmbedder, typename TEmbedDirs, typename TNeRF, typename TNeRFRenderer,
 typename TLeRFEmbedder, typename TLeRF, typename TLeRFRenderer>
-void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, TLeRF, TLeRFRenderer> :: InitializePyramidClipEmbedding(const NeRFExecutorTrainParams &params, const CompactData &data, bool test /*= false*/)
+void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, TLeRF, TLeRFRenderer> :: InitializeTestLeRF(const NeRFExecutorTrainParams &params, const NeRFDatasetParams &data, NeRFDataset &dataset, bool test /*= false*/)
 {
 	try {
 		if (Params.use_lerf)
 		{
-			PyramidEmbedderProperties pyramid_embedder_properties;
-			pyramid_embedder_properties.ImgSize = { Params.clip_input_img_size, Params.clip_input_img_size };	//Входной размер изображения сети
-			pyramid_embedder_properties.Overlap = Params.pyr_embedder_overlap;										///Доля перекрытия
-			///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0 , 1, 2...
-			pyramid_embedder_properties.MaxZoomOut = std::min(log2f(data.W / Params.clip_input_img_size), log2f(data.H / Params.clip_input_img_size));
-			PyramidEmbedder PyramidClipEmbedder(Clip, ClipProcessor, pyramid_embedder_properties);
-
-			if (!std::filesystem::exists(params.PyramidClipEmbeddingSaveDir / "pyramid_embeddings.pt"))
-			{
-				std::cout << "calculating pyramid embeddings..." << std::endl;
-				///Разбить на патчи с перекрытием  +  парочку масштабов (zoomout) и кэшировать эмбеддинги от них
-				PyramidClipEmbedding = PyramidClipEmbedder(data);
-				PyramidClipEmbedding.Save(params.PyramidClipEmbeddingSaveDir / "pyramid_embeddings.pt");
-			}
-			else {
-				std::cout << "loading pyramid embeddings..." << std::endl;
-				PyramidClipEmbedding.Load(params.PyramidClipEmbeddingSaveDir / "pyramid_embeddings.pt");
-			}
 
 			SetLeRFPrompts(Params.lerf_positives, Params.lerf_negatives);
 		}
@@ -897,7 +861,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 			for (int i = 0; i < data.W; i++)
 				for (int j = 0; j < data.H; j++)
 				{
-					torch::Tensor image_features = PyramidClipEmbedding.GetPixelValue(i, j, 0.5f, img_id, pyramid_embedder_properties, cv::Size(data.W, data.H)).to(torch::kCPU);
+					torch::Tensor image_features = dataset.GetPyramidClipEmbedding()->GetPixelValue(i, j, 0.5f, img_id, pyramid_embedder_properties, cv::Size(data.W, data.H)).to(torch::kCPU);
 					//Уже нормировано при вычислении пирамиды normalize features???
 					//image_features = image_features / image_features.norm(2/*L2*/, -1, true);
 					//output = torch::nn::functional::normalize(output, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8));
@@ -912,7 +876,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 					float lv = rel.index({ 0,0 }).item<float>();
 					test_img.at<uchar>(j, i) = cv::saturate_cast<uchar>(lv * 255);	//[-1..1] -> [0..255]
 				}
-			cv::imshow("img", TorchTensorToCVMat(data.Imgs[img_id]));
+			cv::imshow("img", cv::imread(data.ImagePaths[img_id].string(), cv::IMREAD_UNCHANGED));
 			cv::Mat colored_map;
 			cv::applyColorMap(test_img, colored_map, cv::COLORMAP_JET);
 			cv::imshow("test_img", colored_map);
@@ -926,101 +890,29 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 ///
 template <typename TEmbedder, typename TEmbedDirs, typename TNeRF, typename TNeRFRenderer,
 typename TLeRFEmbedder, typename TLeRF, typename TLeRFRenderer>
-void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, TLeRF, TLeRFRenderer> :: Train(const CompactData &data, NeRFExecutorTrainParams &params)
+void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, TLeRF, TLeRFRenderer> :: Train(const NeRFDatasetParams &data, NeRFExecutorTrainParams &params)
 {
 	Initialize(this->Params, data.BoundingBox);
+
+	LeRFDatasetParams lerf_data_params;
+	lerf_data_params.UseLerf = Params.use_lerf;
+	lerf_data_params.clip_input_img_size = Params.clip_input_img_size;
+	lerf_data_params.lang_embed_dim = Params.lang_embed_dim;
+	lerf_data_params.pyr_embedder_overlap = Params.pyr_embedder_overlap;
+	lerf_data_params.PyramidClipEmbeddingSaveDir = params.PyramidClipEmbeddingSaveDir;	
+	NeRFDataset dataset(data, lerf_data_params, params.NRand, params.PrecorpIters, params.PrecorpFrac, Device, Clip, ClipProcessor);
+
 	if (Params.use_lerf)
-		InitializePyramidClipEmbedding(params, data, true);
+		InitializeTestLeRF(params, data, dataset, true);
 
 	int global_step = Start;
-
-	//Prepare raybatch tensor if batching random rays
-	int i_batch;
-	torch::Tensor rays_rgb;
-	torch::Tensor images;
-	torch::Tensor poses = torch::stack(data.Poses, 0).to(Device);
-
-	int n_iters = params.NIters + 1;
-	std::cout << "Begin" << std::endl;
-	for (auto it : data.Splits)
-		std::cout << it << std::endl;
-	for (auto it : data.SplitsIdx)
-		std::cout << it << std::endl;
-
-	for (int i = this->Start + 1; i < n_iters; i++)
+	for (int i = this->Start + 1; i < params.NIters; i++)
 	{
 		auto time0 = std::chrono::steady_clock::now();
 
-		std::pair<torch::Tensor, torch::Tensor> batch_rays;		//{rays_o, rays_d}
-		torch::Tensor batch,
-			target_s;
-		torch::Tensor target_lang_embedding;
+		dataset.SetCurrentIter(i);		//for precorp
 
-		//Random from one image
-		int img_i = RandomInt() % (data.SplitsIdx[0] /* + 1 ? */);
-		auto target = data.Imgs[img_i].squeeze(0).to(Device);		//1, 800, 800, 4 -> 800, 800, 4
-		auto pose = poses.index({ img_i, torch::indexing::Slice(torch::indexing::None, 3), torch::indexing::Slice(torch::indexing::None, 4) });
-
-		if (params.NRand != 0)
-		{
-			///Выбор случайных точек для батча и получение для них параметров луча
-			//Вычисляем границы кадрирования один раз
-			int h_start, h_end, w_start, w_end;
-			if (i < params.PrecorpIters)
-			{
-				int dh = int(data.H / 2 * params.PrecorpFrac);
-				int dw = int(data.W / 2 * params.PrecorpFrac);
-				h_start = data.H / 2 - dh;
-				h_end = data.H / 2 + dh - 1;
-				w_start = data.W / 2 - dw;
-				w_end = data.W / 2 + dw - 1;
-
-				if (i == Start + 1)
-					std::cout << "[Config] Center cropping of size " << 2 * dh << "x" << 2 * dw << " enabled until iter " << params.PrecorpIters << std::endl;
-			} else {
-				h_start = 0;
-				h_end = data.H - 1;
-				w_start = 0;
-				w_end = data.W - 1;
-			}
-
-			auto [rays_o, rays_d] = GetRays(data.H, data.W, data.K, pose);
-
-			//Прямая генерация случайных координат
-			auto options = torch::TensorOptions().dtype(torch::kLong).device(Device);
-			torch::Tensor rand_h = torch::randint(h_start, h_end + 1, { params.NRand }, options);
-			torch::Tensor rand_w = torch::randint(w_start, w_end + 1, { params.NRand }, options);
-			//Эффективное извлечение данных, создаем индексы для пакетного доступа
-			//auto batch_indices = torch::stack({ rand_h, rand_w }, /*dim=*/-1);
-			//Извлекаем лучи и цвета за одну операцию
-			batch_rays.first = rays_o.index({ rand_h, rand_w });
-			batch_rays.second = rays_d.index({ rand_h, rand_w });
-			target_s = target.index({ rand_h, rand_w });
-
-			///Вычислим CLIP эмбеддинги в точках изображения которые попали в батч
-			if (Params.use_lerf)
-			{
-				PyramidEmbedderProperties pyramid_embedder_properties; 
-				pyramid_embedder_properties.ImgSize = {Params.clip_input_img_size, Params.clip_input_img_size};	//Входной размер изображения сети
-				pyramid_embedder_properties.Overlap = Params.pyr_embedder_overlap;										///Доля перекрытия
-				///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0, 1, 2...
-				pyramid_embedder_properties.MaxZoomOut = std::min(log2f(data.W/Params.clip_input_img_size), log2f(data.H/Params.clip_input_img_size));
-				//auto select_coords_cpu = select_coords.to(torch::kCPU).to(torch::kFloat);		//!!!.item<long>()почему то не находит поэтому преобразуем во float
-				target_lang_embedding = torch::ones({params.NRand, Params.lang_embed_dim}, torch::kFloat32);
-				#pragma omp parallel for
-				for (int idx = 0; idx < rand_h.size(0)/*NRand*/; idx++)
-				{
-					target_lang_embedding.index_put_({idx/*, torch::indexing::Slice()*/}, PyramidClipEmbedding.GetPixelValue(
-						rand_h.index({ idx }).to(torch::kCPU).to(torch::kFloat).item<float>(),
-						rand_w.index({ idx }).to(torch::kCPU).to(torch::kFloat).item<float>(),
-						0.5f,		///!!!ПРИВЯЗАТЬСЯ К МАСШТАБУ для этого перенести в RunNetwork по аналогии с calculated_normals			//Get zoom_out_idx from scale //-1, 0, 1, 2 ... <- 1/2, 1, 2, 4 ...
-						img_i,
-						pyramid_embedder_properties,
-						cv::Size(data.W, data.H)
-					));
-				}
-			}		//if use_lerf
-		}		//if (params.NRand != 0)
+		auto batch = dataset.get_batch({});
 
 		//Core optimization loop
 		Optimizer->zero_grad();
@@ -1032,15 +924,15 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 		{
 			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, i, data.BoundingBox, true, Params.calculate_normals || Params.use_pred_normal));
 			auto rgb_disp_acc_extras = std::move(NeRFRenderer->Render(data.H, data.W, data.K,
-				*render_params, batch_rays, torch::Tensor(), torch::Tensor()				/*либо rays либо pose c2w*/
+				*render_params, {batch.data.rays_o, batch.data.rays_d}, torch::Tensor(), torch::Tensor()				/*либо rays либо pose c2w*/
 			));
 			torch::Tensor mse_loss;
 			torch::Tensor img_loss;
 		
-			mse_loss = torch::mse_loss(rgb_disp_acc_extras.Outputs1.RGBMap, target_s.detach());
+			mse_loss = torch::mse_loss(rgb_disp_acc_extras.Outputs1.RGBMap, batch.target.target_s.detach());
 			img_loss = torch::nn::functional::huber_loss(
 						rgb_disp_acc_extras.Outputs1.RGBMap,
-						target_s.detach()
+						batch.target.target_s.detach()
 				);
 			if (params.ReturnRaw)
 				auto trans = rgb_disp_acc_extras.Raw.index({ "...", -1 });		//последний элемент последнего измерения тензора
@@ -1053,10 +945,10 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 		
 			if (rgb_disp_acc_extras.Outputs0.RGBMap.defined() && (rgb_disp_acc_extras.Outputs0.RGBMap.numel() != 0))
 			{
-				auto mse_loss0 = torch::mse_loss(rgb_disp_acc_extras.Outputs0.RGBMap, target_s.detach());
+				auto mse_loss0 = torch::mse_loss(rgb_disp_acc_extras.Outputs0.RGBMap, batch.target.target_s.detach());
 				img_loss0 = torch::nn::functional::huber_loss(
 						rgb_disp_acc_extras.Outputs0.RGBMap,
-						target_s.detach()
+						batch.target.target_s.detach()
 					);
 				loss = loss + img_loss0;
 				psnr0 = -10. * torch::log(mse_loss0) / torch::log(torch::full({ 1/*img_loss.sizes()*/ }, /*value=*/10.f)).to(Device);
@@ -1064,7 +956,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 
 			//add Total Variation loss
 			if constexpr (std::is_same_v<TEmbedder, HashEmbedder>)
-				if (i < n_iters/2)
+				if (i < params.NIters/2)
 				{
 					const float tv_loss_weight = 1e-6;
 					for (int level = 0; level < ExecutorEmbedder->GetNLevels(); level++)
@@ -1127,7 +1019,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 		{
 			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, i, data.BoundingBox, true, Params.calculate_normals || Params.use_pred_normal));
 			auto lerf_render_result = std::move(LeRFRenderer->Render(data.H, data.W, data.K,
-				*render_params, batch_rays, torch::Tensor(), torch::Tensor()				/*либо rays либо pose c2w*/
+				*render_params, { batch.data.rays_o, batch.data.rays_d }, torch::Tensor(), torch::Tensor()				/*либо rays либо pose c2w*/
 			));
 			//lang_loss = torch::nn::functional::cosine_embedding_loss(
 			//	rgb_disp_acc_extras.Outputs1.RenderedLangEmbedding.to(loss.device()),
@@ -1136,7 +1028,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 			//);
 			lang_loss = torch::nn::functional::huber_loss(
 					lerf_render_result.Outputs1.RenderedLangEmbedding.to(loss.device()),
-					target_lang_embedding.detach().to(loss.device()),	//target clip embeddings provided by PyramidEmbedder for a given set of pixels
+					batch.target.target_lang_embedding.detach().to(loss.device()),	//target clip embeddings provided by PyramidEmbedder for a given set of pixels
 					torch::nn::functional::HuberLossFuncOptions().reduction(torch::kNone).delta(1.25)
 				).sum(-1).nanmean();
 			//lang_loss = torch::nn::functional::huber_loss(
@@ -1177,7 +1069,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 			auto test_save_dir = params.BaseDir; /* / ("testset_" + std::to_string(i)) */;
 			if (!std::filesystem::exists(test_save_dir))	std::filesystem::create_directories(test_save_dir);
 			//Есть torch::Tensor poses и есть std::vector<torch::Tensor> data.Poses
-			std::cout << "poses shape " << poses.sizes() << "; test poses count " << data.SplitsIdx[2] << std::endl;   //	std::vector<std::string> Splits = { "train", "val", "test" }; std::vector<int> SplitsIdx = { 0,0,0 };
+			std::cout << "poses shape " << data.Poses[0].sizes() << "; test poses count " << data.SplitsIdx[2] << std::endl;   //	std::vector<std::string> Splits = { "train", "val", "test" }; std::vector<int> SplitsIdx = { 0,0,0 };
 			torch::NoGradGuard no_grad;		///Закоментировал для вычисления нормалей
 
 			std::vector<torch::Tensor> test_poses,
@@ -1216,10 +1108,10 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 		}
 
 		if (i % params.IPrint == 0)
-			std::cout << "[TRAIN] Iter: " << i << " of " << n_iters << " lr = " << new_lrate << " Loss: " << loss.item() << " PSNR: " << psnr.item() << std::endl;
+			std::cout << "[TRAIN] Iter: " << i << " of " << params.NIters << " lr = " << new_lrate << " Loss: " << loss.item() << " PSNR: " << psnr.item() << std::endl;
 
 		global_step++;
-	}	//for (int i = this->Start + 1; i < n_iters; i++)
+	}	//for (int i = this->Start + 1; i < params.NIters; i++)
 }			//NeRFExecutor :: Train
 
 

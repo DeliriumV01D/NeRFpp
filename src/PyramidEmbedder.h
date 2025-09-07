@@ -9,7 +9,7 @@
 #include "RuCLIPProcessor.h"
 #include "TRandomInt.h"
 
-#include "load_blender.h"
+#include "NeRFDatasetParams.h"
 
 #include <memory>
 #include <unordered_map>
@@ -107,9 +107,9 @@ public:
 	);
 
 	///Разбить на патчи с перекрытием  +  парочку масштабов (zoomout) и кэшировать эмбеддинги от них
-	PyramidEmbedding operator()(const CompactData &data);
+	PyramidEmbedding operator()(const NeRFDatasetParams &data);
 
 	///Получить очередной фрагмент изображения вместе с его индексами
 	///!!!Должно быть согласовано с GetNearestPatchCenters/Vertices
-	virtual std::tuple<int, int, int, int, cv::Mat> GetNextSample(const CompactData &data);
+	virtual std::tuple<int, int, int, int, cv::Mat> GetNextSample(const NeRFDatasetParams &data);
 };

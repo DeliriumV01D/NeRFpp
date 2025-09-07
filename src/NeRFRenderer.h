@@ -2,6 +2,7 @@
 
 #include "NeRF.h"
 #include "Sampler.h"
+#include "CustomOps.h"
 
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/imgproc/types_c.h>
@@ -184,7 +185,7 @@ NeRFRendererOutputs NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: RawToOutputs(
 ) {
 	torch::Device device = raw.device();
 	NeRFRendererOutputs result;
-	auto raw2alpha = [](torch::Tensor raw, torch::Tensor dists) {return -torch::exp(-torch::relu(raw) * dists) + 1.f; };
+	auto raw2alpha = [](torch::Tensor raw, torch::Tensor dists) {return - torch::autograd::TruncExp::apply(- torch::relu(raw) * dists)[0] + 1.f; };
 
 	auto dists = z_vals.index({ "...", torch::indexing::Slice(1, torch::indexing::None) }) - z_vals.index({ "...", torch::indexing::Slice(torch::indexing::None, -1) });
 	dists = torch::cat({ dists, (torch::ones(1, torch::kFloat32) * 1e10).expand(dists.index({ "...", torch::indexing::Slice(torch::indexing::None, 1) }).sizes()).to(device)}, -1);  // [N_rays, N_samples]

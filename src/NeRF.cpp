@@ -339,7 +339,7 @@ NeRFSmallImpl :: NeRFSmallImpl(
 		SigmaNet->push_back(torch::nn::Linear(torch::nn::LinearOptions((l == 0) ? InputCh : HiddenDim, (l == NumLayers - 1) ? (1 + GeoFeatDim) : HiddenDim/*, false*/).bias(false)));	// 1 sigma + 15 SH features for color
 
 	for (int l = 0; l < NumLayersColor; l++)
-		ColorNet->push_back(torch::nn::Linear(torch::nn::LinearOptions((l == 0) ? InputChViews + GeoFeatDim + InputCh : HiddenDimColor, (l == NumLayersColor - 1) ? 3 : HiddenDimColor/*, false*/).bias(false)));
+		ColorNet->push_back(torch::nn::Linear(torch::nn::LinearOptions((l == 0) ? InputChViews + GeoFeatDim : HiddenDimColor, (l == NumLayersColor - 1) ? 3 : HiddenDimColor/*, false*/).bias(false)));
 
 	if (UsePredNormal)
 	{
@@ -373,18 +373,18 @@ torch::Tensor NeRFSmallImpl :: forward(torch::Tensor x)
 	for (int i = 0; i < SigmaNet->size(); i++)
 	{
 		h = SigmaNet[i]->as<torch::nn::Linear>()->forward(h);
-		if (i != SigmaNet->size() - 1)
+		if (i != SigmaNet->size() - 1)		//Финальные активации применяются в RawToOutputs
 			h = torch::relu(h);		//!!!inplace = true
 	}
 	sigma = h.index({ "...", 0 });
 	geo_feat = h.index({ "...", torch::indexing::Slice(1, torch::indexing::None) });
 
 	//color
-	h = torch::cat({ input_views, geo_feat, input_pts }, -1);
+	h = torch::cat({ input_views, geo_feat }, -1);
 	for (int i = 0; i < ColorNet->size(); i++)
 	{
 		h = ColorNet[i]->as<torch::nn::Linear>()->forward(h);
-		if (i != ColorNet->size() - 1)
+		if (i != ColorNet->size() - 1)	//Финальные активации применяются в RawToOutputs
 			h = torch::relu(h);		//!!!inplace = true
 	}
 	auto color = h;
@@ -397,7 +397,7 @@ torch::Tensor NeRFSmallImpl :: forward(torch::Tensor x)
 		for (int i = 0; i < NormalsNet->size(); i++)
 		{
 			h = NormalsNet[i]->as<torch::nn::Linear>()->forward(h);
-			if (i != NormalsNet->size() - 1)
+			if (i != NormalsNet->size() - 1)	//Финальные активации применяются в RawToOutputs
 				h = torch::relu(h);		//!!!inplace = true
 			//else
 			//	h = torch::tanh(h);

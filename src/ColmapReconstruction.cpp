@@ -244,9 +244,9 @@ void ColmapReconstruction(	const std::filesystem::path &image_path, const std::f
 
 
 ///Чтение параметров камер из базы данных colmap реконструкции
-CompactData LoadFromColmapReconstruction( const std::filesystem::path &workspace_path)
+NeRFDatasetParams LoadFromColmapReconstruction( const std::filesystem::path &workspace_path)
 {
-	CompactData result;
+	NeRFDatasetParams result;
 	std::string image_path;
 	
 	const std::filesystem::path database_path = workspace_path/"database.db";
@@ -309,7 +309,7 @@ CompactData LoadFromColmapReconstruction( const std::filesystem::path &workspace
 		std::cout << "channels" << img.channels() << std::endl;
 		cv::imshow("img", img);
 		cv::waitKey(1);
-		result.Imgs.emplace_back(CVMatToTorchTensor(img));
+		result.ImagePaths.push_back(image_path + "/" + im.second.Name());
 		std::cout << image_path + "/" + im.second.Name() << std::endl;
 
 		if (im.second.HasPose())
@@ -323,11 +323,14 @@ CompactData LoadFromColmapReconstruction( const std::filesystem::path &workspace
 		std::cout << std::endl;
 	}
 
+	//// Get intrinsic calibration matrix composed from focal length and principal
+	//// point parameters, excluding distortion parameters.
+	//Eigen::Matrix3d CalibrationMatrix() const; in reconstruction.Cameras()
 	//!!!
 	float kdata[] = { result.Focal, 0, 0.5f * result.W,
 		0, result.Focal, 0.5f * result.H,
 		0, 0, 1 };
-	result.K = torch::from_blob(kdata, { 3, 3 }, torch::kFloat32);
+	result.K = torch::from_blob(kdata, { 3, 3 }, torch::kFloat32).clone().detach();;
 	//result.K = GetCalibrationMatrix(result.Focal, result.W, result.H);
 	auto bounds = GetBoundsForObj(result);			///!!!Можно придумать что-то поизящнее чем просто найти максимальную дистанцию между камерами, например, привязаться к параметрам камеры, оценить из имеющейся разреженной реконструкции
 	result.Near = bounds.first;
