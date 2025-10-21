@@ -138,7 +138,8 @@ struct NeRFDatasetParams {
 struct LeRFDatasetParams {
 	bool UseLerf;
 	int clip_input_img_size,
-		lang_embed_dim;
+		lang_embed_dim,
+		MinZoomOut;		//0 or -1
 	float pyr_embedder_overlap;
 	std::filesystem::path PyramidClipEmbeddingSaveDir;
 };		//LeRFDatasetParams

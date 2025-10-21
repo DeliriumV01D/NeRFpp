@@ -65,8 +65,19 @@ inline torch::Tensor GetCalibrationMatrix(const float focal, const float w, cons
 	return torch::from_blob(kdata, { 3, 3 }/*, torch::kFloat32*/).clone().detach();
 }
 
-
-
+//Найти матрицу калибровки с новыми значениями w, h но сохраняющую FOV исходной матрицы
+inline torch::Tensor GetSameFOVCalibrationMatrix(torch::Tensor k, const float new_w, const float new_h)
+{
+	float focal_length = k[0][0].item<float>(),
+		w = k[0][2].item<float>() * 2,
+		h = k[1][2].item<float>() * 2;
+	float camera_angle = 2.f * atanf((w > h ? w : h) / 2 / focal_length);
+	float new_focal_length = .5f * (new_w > new_h ? new_w : new_h)/ tanf(.5f * camera_angle);
+	float kdata[] = { new_focal_length, 0, 0.5f * new_w,
+		0, new_focal_length, 0.5f * new_h,
+		0, 0, 1 };
+	return torch::from_blob(kdata, { 3, 3 }/*, torch::kFloat32*/).clone().detach();
+}
 
 
 inline std::pair<float, float> GetBoundsForObj(const NeRFDatasetParams& data)

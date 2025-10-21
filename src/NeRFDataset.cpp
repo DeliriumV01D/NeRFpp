@@ -70,6 +70,7 @@ void NeRFDataset :: InitializePyramidClipEmbedding()
 			PyramidEmbedderProperties pyramid_embedder_properties;
 			pyramid_embedder_properties.ImgSize = { LeRFParams.clip_input_img_size, LeRFParams.clip_input_img_size };	//Входной размер изображения сети
 			pyramid_embedder_properties.Overlap = LeRFParams.pyr_embedder_overlap;										///Доля перекрытия
+			pyramid_embedder_properties.MinZoomOut = LeRFParams.MinZoomOut;		//0 or -1
 			///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0 , 1, 2...
 			pyramid_embedder_properties.MaxZoomOut = std::min(log2f(Params.W / LeRFParams.clip_input_img_size), log2f(Params.H / LeRFParams.clip_input_img_size));
 			PyramidEmbedder PyramidClipEmbedder(Clip, ClipProcessor, pyramid_embedder_properties);
@@ -143,6 +144,7 @@ NeRFDataExample  NeRFDataset :: get_batch(std::vector<size_t> request/*Не ис
 		PyramidEmbedderProperties pyramid_embedder_properties;
 		pyramid_embedder_properties.ImgSize = { LeRFParams.clip_input_img_size, LeRFParams.clip_input_img_size };	//Входной размер изображения сети
 		pyramid_embedder_properties.Overlap = LeRFParams.pyr_embedder_overlap;										///Доля перекрытия
+		pyramid_embedder_properties.MinZoomOut = LeRFParams.MinZoomOut;
 		///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0, 1, 2...
 		pyramid_embedder_properties.MaxZoomOut = std::min(log2f(Params.W / LeRFParams.clip_input_img_size), log2f(Params.H / LeRFParams.clip_input_img_size));
 		//auto select_coords_cpu = select_coords.to(torch::kCPU).to(torch::kFloat);		//!!!.item<long>()почему то не находит поэтому преобразуем во float

@@ -45,6 +45,8 @@ struct NeRFRenderParams {
 
 inline torch::Tensor CVMatToTorchTensor(cv::Mat img, const bool perm = false)
 {
+	if (!img.isContinuous())
+		img = img.clone();
 	auto tensor_image = torch::from_blob(img.data, { img.rows, img.cols, img.channels() }, at::kByte);
 	if (perm)
 		tensor_image = tensor_image.permute({ 2,0,1 });
@@ -63,6 +65,23 @@ inline cv::Mat TorchTensorToCVMat(torch::Tensor tensor_image, const bool perm = 
 	cv::Mat result_img;
 	cv::Mat(t.size(0), t.size(1), CV_MAKETYPE(CV_8U, t.sizes().size() >= 3 ? t.size(2) : 1), t.data_ptr()).copyTo(result_img);
 	return result_img;
+}
+
+///c2w <-> w2c, w2c <-> c2w
+static torch::Tensor C2W2C(torch::Tensor in)
+{
+	torch::Tensor out = torch::eye(4, torch::TensorOptions().dtype(torch::kFloat32).device(in.device()));
+	//Извлекаем компоненты
+	torch::Tensor R = in.index({ torch::indexing::Slice(0, 3), torch::indexing::Slice(0, 3) });
+	torch::Tensor t = in.index({ torch::indexing::Slice(0, 3), 3 });
+	//Вычисляем обратные компоненты
+	torch::Tensor R_inv = torch::linalg_inv(R);		//R.transpose(0, 1); //Для ортогональной матрицы обратная = транспонированная
+	torch::Tensor t_inv = -torch::matmul(R_inv, t);
+	//Собираем обратную матрицу
+	out.index_put_({ torch::indexing::Slice(0, 3), torch::indexing::Slice(0, 3) }, R_inv);
+	out.index_put_({ torch::indexing::Slice(0, 3), 3 }, t_inv);
+	//out[3][3] = 1;
+	return out;
 }
 
 ///

@@ -27,7 +27,7 @@
 
 #include <opencv2/core/quaternion.hpp>
 
-static torch::Tensor Rigid3dToTransformationMat(const colmap::Rigid3d &rigid3d)
+static torch::Tensor ColmapW2CToNeRFC2W(const colmap::Rigid3d &rigid3d)
 {
 	//Создание кватерниона из колмаповского кватерниона	
 	cv::Quat<float> q(rigid3d.rotation.w(), rigid3d.rotation.x(), rigid3d.rotation.y(), rigid3d.rotation.z()); // w, x, y, z
@@ -35,18 +35,26 @@ static torch::Tensor Rigid3dToTransformationMat(const colmap::Rigid3d &rigid3d)
 	//Вычисление матрицы вращения из кватерниона
 	auto R = q.toRotMat3x3();
 
-	//Объединение матрицы вращения и матрицы трансляции в матрицу преобразования
-	torch::Tensor pose = torch::zeros({ 4, 4 });
+	torch::Tensor R_tens = torch::zeros({ 3, 3 });
 	for (size_t row = 0; row < R.rows; row++)
 		for (size_t col = 0; col < R.cols; col++)
-			pose[row][col] = R(row, col);
+			R_tens[row][col] = R(row, col);
 
+	//Вектор трансляции
+	torch::Tensor t_tens = torch::zeros({ 3 });
 	for (size_t row = 0; row < rigid3d.translation.size(); row++)
-		pose[row][3] = rigid3d.translation[row];
-	pose[3][3] = 1;
+		t_tens[row] = rigid3d.translation[row];
 
 	//w2c->c2w
-	pose = pose.inverse();
+	torch::Tensor R_inv = torch::linalg_inv(R_tens);	//R.transpose(0, 1); // Для ортогональной матрицы вращения обратная = транспонированная
+	torch::Tensor t_inv = -torch::matmul(R_inv, t_tens);
+
+	//Собираем обратную матрицу camera-to-world
+	torch::Tensor pose = torch::eye(4);
+	pose.index_put_({ torch::indexing::Slice(0, 3), torch::indexing::Slice(0, 3) }, R_inv);
+	pose.index_put_({ torch::indexing::Slice(0, 3), 3 }, t_inv);
+	//pose[3][3] = 1;
+
 	//Convert from COLMAP's camera coordinate system (OpenCV) to NeRF (OpenGL) | righthanded <-> lefthanded
 	pose.index({torch::indexing::Slice(0, 3), torch::indexing::Slice(1, 3)}) *= - 1;
 
@@ -55,33 +63,6 @@ static torch::Tensor Rigid3dToTransformationMat(const colmap::Rigid3d &rigid3d)
 	
 	return pose;
 }
-
-////Левосторонняя <-> правосторонняя
-//static torch::Tensor Rigid3dToTransformationMat(const colmap::Rigid3d &rigid3d)
-//{
-//	//Создание кватерниона из колмаповского кватерниона	
-//	cv::Quat<float> q(rigid3d.rotation.w(), -rigid3d.rotation.x(), -rigid3d.rotation.y(), rigid3d.rotation.z()); // w, x, y, z
-//
-//	//Вычисление матрицы вращения из кватерниона
-//	auto R = q.toRotMat3x3();
-//
-//	//Объединение матрицы вращения и матрицы трансляции в матрицу преобразования
-//	torch::Tensor pose = torch::zeros({ 4, 4 });
-//	for (size_t row = 0; row < R.rows; row++)
-//		for (size_t col = 0; col < R.cols; col++)
-//			pose[row][col] = R(row, col);
-//
-//	for (size_t row = 0; row < rigid3d.translation.size(); row++)
-//		pose[row][3] = rigid3d.translation[row];
-//	pose[1][3] = - pose[1][3];
-//	pose[3][3] = 1;
-//
-//	std::cout<<"rigid3d: "<<rigid3d<<std::endl;
-//	std::cout<<"quat: "<<q<<"Rot: "<<R<<std::endl;
-//	
-//	return pose;
-//}
-
 
 void ColmapReconstruction(	const std::filesystem::path &image_path, const std::filesystem::path &workspace_path)
 {
@@ -226,20 +207,81 @@ void ColmapReconstruction(	const std::filesystem::path &image_path, const std::f
 
 	controller->Start();
 	controller->Wait();
-	//while (!controller->IsFinished()) {
-	//	std::this_thread::sleep_for(std::chrono::milliseconds(10));
-	//}
 
 	std::cout << "Reconstruction completed successfully." << std::endl;
-
-	//controller->Stop();
-	//while (!controller->IsStopped()){}
 
 	//ВМЕСТО AutomaticReconstructionController
 	// 	colmap::HierarchicalPipeline controller(options, reconstruction_manager);
 	//// Hierarchical mapping first hierarchically partitions the scene into multiple overlapping clusters, then reconstructs them separately using incremental
 	//// mapping, and finally merges them all into a globally consistent reconstruction. This is especially useful for larger-scale scenes, since
 	//// incremental mapping becomes slow with an increasing number of images.
+}
+
+
+///
+std::pair<float, float> ComputeNearFarForImage(
+	const colmap::Image &image,
+	const colmap::Reconstruction &reconstruction,
+	float near_percentile /*= 0.1f*/,
+	float far_percentile /*= 0.9f*/
+) {
+	std::vector<float> distances;
+	const colmap::Camera &camera = reconstruction.Camera(image.CameraId());
+
+	//Позиция камеры в мировых координатах
+	Eigen::Vector3d camera_pos = image.CamFromWorld().translation;
+
+	for (const auto &point2D : image.Points2D())
+	{
+		if (point2D.HasPoint3D())
+		{
+			const colmap::Point3D &point3D = reconstruction.Point3D(point2D.point3D_id);
+			double distance = (point3D.xyz - camera_pos).norm();
+			distances.push_back(static_cast<float>(distance));
+		}
+	}
+
+	if (distances.empty())
+		return { 0.f, 0.f }; //Значения по умолчанию
+
+	std::sort(distances.begin(), distances.end());
+	size_t near_idx = std::min(static_cast<size_t>(near_percentile * distances.size()), distances.size() - 1);
+	size_t far_idx = std::min(static_cast<size_t>(far_percentile * distances.size()), distances.size() - 1);
+
+	return { distances[near_idx], distances[far_idx] };
+}
+
+
+///
+std::pair<float, float> ComputeGlobalNearFar(
+	colmap::Reconstruction &reconstruction,
+	float near_percentile /*= 0.1f*/,
+	float far_percentile /*= 0.9f*/
+){
+	std::vector<float> all_nears;
+	std::vector<float> all_fars;
+
+	for (const auto &image_id : reconstruction.RegImageIds())
+	{
+		const colmap::Image &image = reconstruction.Image(image_id);
+		auto [near, far] = ComputeNearFarForImage(image, reconstruction, near_percentile, far_percentile);
+		if (near != 0.f && far != 0.f)
+		{
+			all_nears.push_back(near);
+			all_fars.push_back(far);
+		}
+	}
+
+	if (all_nears.empty() || all_fars.empty())
+		return { 0.1f, 10.0f };
+
+	std::sort(all_nears.begin(), all_nears.end());
+	std::sort(all_fars.begin(), all_fars.end());
+
+	size_t near_idx = std::min(static_cast<size_t>(0.f * all_nears.size()), all_nears.size() - 1);
+	size_t far_idx = std::min(static_cast<size_t>(0.99f * all_fars.size()), all_fars.size() - 1);
+
+	return { all_nears[near_idx], all_fars[far_idx] };
 }
 
 
@@ -314,7 +356,7 @@ NeRFDatasetParams LoadFromColmapReconstruction( const std::filesystem::path &wor
 
 		if (im.second.HasPose())
 		{
-			auto pose = Rigid3dToTransformationMat(im.second.CamFromWorld());
+			auto pose = ColmapW2CToNeRFC2W(im.second.CamFromWorld());
 			std::cout <<"pose: " << pose << std::endl;
 			result.Poses.emplace_back(pose);
 		} else {
@@ -330,11 +372,21 @@ NeRFDatasetParams LoadFromColmapReconstruction( const std::filesystem::path &wor
 	float kdata[] = { result.Focal, 0, 0.5f * result.W,
 		0, result.Focal, 0.5f * result.H,
 		0, 0, 1 };
-	result.K = torch::from_blob(kdata, { 3, 3 }, torch::kFloat32).clone().detach();;
+	result.K = torch::from_blob(kdata, { 3, 3 }, torch::kFloat32).clone().detach();
+	std::cout << "K: " << result.K << std::endl;
 	//result.K = GetCalibrationMatrix(result.Focal, result.W, result.H);
-	auto bounds = GetBoundsForObj(result);			///!!!Можно придумать что-то поизящнее чем просто найти максимальную дистанцию между камерами, например, привязаться к параметрам камеры, оценить из имеющейся разреженной реконструкции
-	result.Near = bounds.first;
-	result.Far = bounds.second;
+	//auto bounds = GetBoundsForObj(result);			///!!!Можно придумать что-то поизящнее чем просто найти максимальную дистанцию между камерами, например, привязаться к параметрам камеры, оценить из имеющейся разреженной реконструкции
+	//result.Near = bounds.first;
+	//result.Far = bounds.second;
+	auto [global_near, global_far] = ComputeGlobalNearFar(reconstruction, 0.f, 0.95f);
+	result.Near = global_near;
+	result.Far = global_far;
 	result.BoundingBox = GetBbox3dForObj(result);		//(train_poses, result.H, result.W, /*near =*/ 2.0f, /*far =*/ 6.0f);
+	//auto colmap_bb = reconstruction.ComputeBoundingBox(0.01, 0.99);
+	//torch::Tensor min_bound = torch::tensor({ (float)colmap_bb.first.x(), (float)colmap_bb.first.y(), (float)colmap_bb.first.z() }),
+	//	max_bound = torch::tensor({ (float)colmap_bb.second.x(), (float)colmap_bb.second.y(), (float)colmap_bb.second.z() }),
+	//	d = torch::norm(max_bound - min_bound);
+	//result.BoundingBox = torch::cat({ min_bound - d * 0.05, max_bound + d * 0.05}, -1);//GetBbox3dForObj(result);
+	std::cout << "result.BoundingBox: " << result.BoundingBox <<"; Near: "<< result.Near <<"; Far: "<< result.Far << std::endl;
 	return result;
 }

@@ -22,7 +22,8 @@ struct PyramidEmbedderProperties
 {
 	cv::Size ImgSize {0, 0};	//Входной размер изображения сети
 	float Overlap {0.75};			///Доля перекрытия
-	int MaxZoomOut{1};				///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0 , 1, 2...
+	int MaxZoomOut{ 1 },				///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0 , 1, 2...
+		MinZoomOut{1};
 };
 
 

@@ -59,12 +59,13 @@ struct NeRFExecutorParams
 		n_features_per_level_le = n_features_per_level,								//for language embedder
 		log2_hashmap_size_le = log2_hashmap_size - 3,									//for language embedder
 		base_resolution_le = base_resolution,													//for language embedder
-		finest_resolution_le = finest_resolution/4,										//for language embedder
+		finest_resolution_le = finest_resolution / 4,										//for language embedder
 		clip_input_img_size{ 336 },	//Input RuClip model size
 		num_layers_le{ 3 },					//Language embedder head params
 		hidden_dim_le{ 64 },				//Language embedder head params
 		lang_embed_dim{ 768 },			//Language embedder head params
-		geo_feat_dim_le{ 32 };			//Language embedder head params
+		geo_feat_dim_le{ 32 },			//Language embedder head params
+		pyr_embed_min_zoom_out{ 0 };
 	torch::Device device{ torch::kCUDA };
 	float learning_rate{ 5e-4 },
 		pyr_embedder_overlap{0.75};
@@ -111,6 +112,7 @@ struct NeRFExecutorParams
 		j["hidden_dim_le"] = hidden_dim_le;
 		j["lang_embed_dim"] = lang_embed_dim;
 		j["geo_feat_dim_le"] = geo_feat_dim_le;
+		j["lang_embed_min_zoom_out"] = pyr_embed_min_zoom_out;
 		j["device"] = device.str();			//
 		j["learning_rate"] = learning_rate;
 		j["pyr_embedder_overlap"] = pyr_embedder_overlap;
@@ -158,6 +160,7 @@ struct NeRFExecutorParams
 		j.at("hidden_dim_le").get_to(hidden_dim_le);
 		j.at("lang_embed_dim").get_to(lang_embed_dim);
 		j.at("geo_feat_dim_le").get_to(geo_feat_dim_le);
+		j.at("lang_embed_min_zoom_out").get_to(pyr_embed_min_zoom_out);
 		device = torch::Device(j.at("device").get<std::string>());					// Приводим device к правильному типу
 		learning_rate = j.at("learning_rate").get<float>();
 		pyr_embedder_overlap = j.at("pyr_embedder_overlap").get<float>();
@@ -329,8 +332,8 @@ protected:
 	std::unique_ptr<TLeRFRenderer> LeRFRenderer = nullptr;
 	std::vector<torch::Tensor> GradVars;
 	std::unique_ptr<torch::optim::Adam> Optimizer;
-	int Start = 0,
-		NImportance{ 0 };
+	int Start{0},
+		NImportance{0};
 	float LearningRate,
 		StochasticPreconditioningAlpha0;
 	torch::Device Device;
@@ -548,7 +551,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 			auto temp = ModelFine->parameters();
 			GradVars.insert(GradVars.end(), std::make_move_iterator(temp.begin()), std::make_move_iterator(temp.end()));
 
-			for (auto& k : ModelFine->named_parameters())
+			for (auto &k : ModelFine->named_parameters())
 				std::cout << k.key() << std::endl;
 			std::cout << "ModelFine params count: " << Trainable::ParamsCount(ModelFine) << std::endl;
 		}		//if n_importance > 0
@@ -847,6 +850,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 			PyramidEmbedderProperties pyramid_embedder_properties;
 			pyramid_embedder_properties.ImgSize = { Params.clip_input_img_size, Params.clip_input_img_size };	//Входной размер изображения сети
 			pyramid_embedder_properties.Overlap = Params.pyr_embedder_overlap;										///Доля перекрытия
+			pyramid_embedder_properties.MinZoomOut = Params.pyr_embed_min_zoom_out;		//0 or -1
 			///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0 , 1, 2...
 			pyramid_embedder_properties.MaxZoomOut = std::min(log2f(data.W / Params.clip_input_img_size), log2f(data.H / Params.clip_input_img_size));
 			//auto scale = Clip->GetLogitScale().exp().to(torch::kCPU);
@@ -898,6 +902,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 	lerf_data_params.UseLerf = Params.use_lerf;
 	lerf_data_params.clip_input_img_size = Params.clip_input_img_size;
 	lerf_data_params.lang_embed_dim = Params.lang_embed_dim;
+	lerf_data_params.MinZoomOut = Params.pyr_embed_min_zoom_out;
 	lerf_data_params.pyr_embedder_overlap = Params.pyr_embedder_overlap;
 	lerf_data_params.PyramidClipEmbeddingSaveDir = params.PyramidClipEmbeddingSaveDir;	
 	NeRFDataset dataset(data, lerf_data_params, params.NRand, params.PrecorpIters, params.PrecorpFrac, Device, Clip, ClipProcessor);
@@ -1084,7 +1089,10 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 					test_poses.push_back(data.Poses[k].to(Device));
 			}
 
-			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, std::numeric_limits<int>::max(), torch::Tensor(), false, false));
+			//reset_near_plane: whether to reset the near plane to 0.0 during inference.The near plane can be
+			//helpful for reducing floaters during training, but it can cause clipping artifacts during
+			//inference when an evaluation or viewer camera moves closer to the object.
+			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, 0.f/*data.Near*/, data.Far, std::numeric_limits<int>::max(), torch::Tensor(), false, false));
 			RenderPath(test_poses/*poses[i_test]).to(device)*/, data.H, data.W, data.Focal, data.K, *render_params,
 				{ torch::Tensor(), torch::Tensor() }, /*c2w_staticcam*/torch::Tensor(), /*test_imgs,*/ test_save_dir
 			);
@@ -1098,7 +1106,10 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 			torch::NoGradGuard no_grad;
 			auto dir = params.BaseDir / "render";
 			if (!std::filesystem::exists(dir))	std::filesystem::create_directories(dir);
-			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, data.Near, data.Far, std::numeric_limits<int>::max(), torch::Tensor(), false, false));
+			//reset_near_plane: whether to reset the near plane to 0.0 during inference.The near plane can be
+			//helpful for reducing floaters during training, but it can cause clipping artifacts during
+			//inference when an evaluation or viewer camera moves closer to the object.
+			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, 0.f/*data.Near*/, data.Far, std::numeric_limits<int>::max(), torch::Tensor(), false, false));
 			RenderPath(data.RenderPoses, data.H, data.W, data.Focal, data.K, *render_params, { torch::Tensor(), torch::Tensor() },
 				/*c2w_staticcam*/torch::Tensor(),/*, data.Imgs,*/  dir/*, params.RenderFactor*/
 			);
