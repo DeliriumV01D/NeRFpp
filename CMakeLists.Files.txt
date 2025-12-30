@@ -56,6 +56,7 @@ set(HEADERS ${HEADERS}
 	src/CuSHEncoder.h
 	src/CuHashEmbedder.h
 	src/NeRF.h
+	src/Sampler.h
 	src/NeRFRenderer.h
 	src/NeRFExecutor.h
 	src/Common/TRandomInt.h

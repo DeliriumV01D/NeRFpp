@@ -17,5 +17,5 @@ nlohmann json(https://github.com/nlohmann/json)
 
 ![short](https://github.com/DeliriumV01D/NeRFpp/assets/46240032/b04924ed-c198-4da3-b699-756d4675018c)
 
-
+If you find this repository useful, please consider giving it a star ⭐
 
