@@ -23,21 +23,24 @@
 #include <colmap/controllers/automatic_reconstruction.h>
 #include <colmap/scene/reconstruction_manager.h>
 #include <colmap/controllers/hierarchical_pipeline.h>
+
+#include <colmap/image/undistortion.h>
 //#endif
+
 
 #include <opencv2/core/quaternion.hpp>
 
 static torch::Tensor ColmapW2CToNeRFC2W(const colmap::Rigid3d &rigid3d)
 {
 	//Создание кватерниона из колмаповского кватерниона	
-	cv::Quat<float> q(rigid3d.rotation.w(), rigid3d.rotation.x(), rigid3d.rotation.y(), rigid3d.rotation.z()); // w, x, y, z
+	cv::Quat<float> q(static_cast<float>(rigid3d.rotation.w()), static_cast<float>(rigid3d.rotation.x()), static_cast<float>(rigid3d.rotation.y()), static_cast<float>(rigid3d.rotation.z())); // w, x, y, z
 
 	//Вычисление матрицы вращения из кватерниона
 	auto R = q.toRotMat3x3();
 
 	torch::Tensor R_tens = torch::zeros({ 3, 3 });
-	for (size_t row = 0; row < R.rows; row++)
-		for (size_t col = 0; col < R.cols; col++)
+	for (int row = 0; row < R.rows; row++)
+		for (int col = 0; col < R.cols; col++)
 			R_tens[row][col] = R(row, col);
 
 	//Вектор трансляции
@@ -191,7 +194,7 @@ void ColmapReconstruction(	const std::filesystem::path &image_path, const std::f
 	std::shared_ptr<colmap::ReconstructionManager> reconstruction_manager = std::make_shared<colmap::ReconstructionManager>();
 	options.image_path = image_path.string();					// The path to the image folder which are used as input
 	options.workspace_path = workspace_path.string();	// The path to the workspace folder in which all results are stored.
-	options.quality = colmap::AutomaticReconstructionController::Quality::EXTREME;			// Whether to perform low- or high-quality reconstruction.
+	options.quality = colmap::AutomaticReconstructionController::Quality::HIGH;			// Whether to perform low- or high-quality reconstruction.
 	options.single_camera = true;/*false*/;						// Whether to use shared intrinsics or not.
 	options.single_camera_per_folder = true;/*false*/;	// Whether to use shared intrinsics or not for all images in the same sub-folder.
 	options.camera_model = "OPENCV";					// Which camera model to use for images.  FULL_OPENCV, OPENCV_FISHEYE
@@ -203,7 +206,6 @@ void ColmapReconstruction(	const std::filesystem::path &image_path, const std::f
 	std::shared_ptr<colmap::AutomaticReconstructionController> controller = std::make_shared<colmap::AutomaticReconstructionController>(options, reconstruction_manager);
 
 	std::cout << "begin reconstruction" << std::endl;
-
 
 	controller->Start();
 	controller->Wait();
@@ -252,36 +254,16 @@ std::pair<float, float> ComputeNearFarForImage(
 }
 
 
-///
-std::pair<float, float> ComputeGlobalNearFar(
-	colmap::Reconstruction &reconstruction,
-	float near_percentile /*= 0.1f*/,
-	float far_percentile /*= 0.9f*/
-){
-	std::vector<float> all_nears;
-	std::vector<float> all_fars;
-
-	for (const auto &image_id : reconstruction.RegImageIds())
-	{
-		const colmap::Image &image = reconstruction.Image(image_id);
-		auto [near, far] = ComputeNearFarForImage(image, reconstruction, near_percentile, far_percentile);
-		if (near != 0.f && far != 0.f)
-		{
-			all_nears.push_back(near);
-			all_fars.push_back(far);
-		}
-	}
-
-	if (all_nears.empty() || all_fars.empty())
-		return { 0.1f, 10.0f };
-
-	std::sort(all_nears.begin(), all_nears.end());
-	std::sort(all_fars.begin(), all_fars.end());
-
-	size_t near_idx = std::min(static_cast<size_t>(0.f * all_nears.size()), all_nears.size() - 1);
-	size_t far_idx = std::min(static_cast<size_t>(0.99f * all_fars.size()), all_fars.size() - 1);
-
-	return { all_nears[near_idx], all_fars[far_idx] };
+void UndistortImages(colmap::Reconstruction &reconstruction, const std::filesystem::path &image_path, const std::filesystem::path &output_path, bool use_gpu /*= false*/)
+{
+	std::cout << "Starting image undistortion..." << std::endl;
+	colmap::UndistortCameraOptions undistortion_options;
+	//undistortion_options.max_image_size = max_image_size;
+	//COLMAPUndistorter, PMVSUndistorter, CMPMVSUndistorter
+	colmap::COLMAPUndistorter undistorter(undistortion_options, reconstruction, image_path.string(), output_path.string());
+	//undistorter.SetCheckIfStoppedFunc([&]() { return IsStopped(); });
+	undistorter.Run();
+	std::cout << "Image undistortion completed successfully." << std::endl;
 }
 
 
@@ -293,51 +275,62 @@ NeRFDatasetParams LoadFromColmapReconstruction( const std::filesystem::path &wor
 	
 	const std::filesystem::path database_path = workspace_path/"database.db";
 	const std::filesystem::path sparse_path = workspace_path/"sparse";
+	const std::filesystem::path undistorted_path = workspace_path/"undistorted";
 
-	//Прочитать путь image_path из строки *.ini файла
-	std::filesystem::path ini_file_path;
-	for (const auto &entry : std::filesystem::directory_iterator(sparse_path))
-	{
-		if (entry.is_regular_file() && entry.path().extension() == ".ini")
-		{
-			ini_file_path = entry.path();
-			break;
-		}
-	}
-	if (!ini_file_path.empty())
-		std::cout<<"found COLMAP project configuration file "<<ini_file_path.string()<<std::endl;
-	else
-		std::cout<<"could not found COLMAP project configuration file!"<<std::endl;
 
-	std::ifstream file(ini_file_path);
-	if (!file.is_open())
-		std::cerr << "cannot open file " <<ini_file_path.string()<< std::endl;
 
-	std::string line;
-	while (std::getline(file, line))
-	{
-		if (line.rfind("image_path=", 0) == 0)
-		{
-			image_path = line.substr(11);
-			break;
-		}
-	}
-	std::cout<<"image path: "<<image_path<<std::endl;
-
-	//// Получение всех реконструкций из базы данных
+	////Получение всех реконструкций из базы данных
 	//std::vector<colmap::Reconstruction> reconstructions = database.ReadAllReconstructions(&reconstructions);
 	colmap::Reconstruction reconstruction;
 	reconstruction.Read((sparse_path/"0").string());
 
-	//reconstruction.ComputeBoundingBox();
-	//result.SplitsIdx[0] = reconstruction.Images().size();
+	//Андисторт
+	if (!std::filesystem::exists(undistorted_path))
+	{
+		//Прочитать путь image_path из строки *.ini файла
+		std::filesystem::path ini_file_path;
+		for (const auto &entry : std::filesystem::directory_iterator(sparse_path))
+		{
+			if (entry.is_regular_file() && entry.path().extension() == ".ini")
+			{
+				ini_file_path = entry.path();
+				break;
+			}
+		}
+		if (!ini_file_path.empty())
+			std::cout << "found COLMAP project configuration file " << ini_file_path.string() << std::endl;
+		else
+			std::cout << "could not found COLMAP project configuration file!" << std::endl;
 
-	// Итерация по всем камерам и вывод их параметров
+		std::ifstream file(ini_file_path);
+		if (!file.is_open())
+			std::cerr << "cannot open file " << ini_file_path.string() << std::endl;
+
+		std::string line;
+		while (std::getline(file, line))
+		{
+			if (line.rfind("image_path=", 0) == 0)
+			{
+				image_path = line.substr(11);
+				break;
+			}
+		}
+		std::cout << "image path: " << image_path << std::endl;
+
+		std::filesystem::create_directories(undistorted_path);
+		UndistortImages(reconstruction, image_path, undistorted_path, /*use_gpu*/false);
+	}
+
+	image_path = (undistorted_path / "images").string();
+	std::cout << "image path: " << image_path << std::endl;
+	reconstruction.Read((undistorted_path / "sparse").string());
+
+	//Итерация по всем камерам и вывод их параметров
 	for (const auto &camera : reconstruction.Cameras())
 	{
-		result.H = camera.second.height;
-		result.W = camera.second.width;
-		result.Focal = camera.second.FocalLength();
+		//result.H = camera.second.height;
+		//result.W = camera.second.width;
+		//result.Focal = camera.second.FocalLength();
 		std::cout<<"camera_t: "<<camera.first<< "Camera ID: " << camera.second.camera_id << "Model: " << camera.second.ModelName() << std::endl;
 		//std::cout<<camera.second.PrincipalPointX()<<" "<<camera.second.PrincipalPointY()<<" "<<camera.second.FocalLengthX()<<" "<<camera.second.FocalLengthY()<<std::endl;
 	}
@@ -351,42 +344,49 @@ NeRFDatasetParams LoadFromColmapReconstruction( const std::filesystem::path &wor
 		std::cout << "channels" << img.channels() << std::endl;
 		cv::imshow("img", img);
 		cv::waitKey(1);
-		result.ImagePaths.push_back(image_path + "/" + im.second.Name());
-		std::cout << image_path + "/" + im.second.Name() << std::endl;
+
+		View view;
+		view.ID = im.second.ImageId();
+		view.ImagePath = image_path + "/" + im.second.Name();
+		std::cout << view.ImagePath << std::endl;
+
+		if (im.second.HasCameraPtr())
+		{
+			view.H = im.second.CameraPtr()->height;
+			view.W = im.second.CameraPtr()->width;
+			view.Focal = im.second.CameraPtr()->FocalLength();
+			//Get intrinsic calibration matrix composed from focal length and principal point parameters, excluding distortion parameters.
+			//Eigen::Matrix3d CalibrationMatrix() const; in reconstruction.Cameras()
+			float kdata[] = { (float)im.second.CameraPtr()->FocalLengthX(), 0, (float)im.second.CameraPtr()->PrincipalPointX(),
+				0, (float)im.second.CameraPtr()->FocalLengthY(), (float)im.second.CameraPtr()->PrincipalPointY(),
+				0, 0, 1 };
+			view.K = torch::from_blob(kdata, { 3, 3 }, torch::kFloat32).clone().detach();
+			std::cout << "K: " << view.K << std::endl;
+			//result.K = GetCalibrationMatrix(result.Focal, result.W, result.H);
+		} else {
+			std::cout << "has not camera ptr" << std::endl;
+			continue;
+		}
 
 		if (im.second.HasPose())
 		{
-			auto pose = ColmapW2CToNeRFC2W(im.second.CamFromWorld());
-			std::cout <<"pose: " << pose << std::endl;
-			result.Poses.emplace_back(pose);
+			view.Pose = ColmapW2CToNeRFC2W(im.second.CamFromWorld());
+			std::tie(view.Near, view.Far) = ComputeNearFarForImage(im.second, reconstruction, 0.01f, 0.99f);
+			std::cout <<"pose: " << view.Pose <<"; near:  "<<view.Near<<"; far:  "<< view.Far << std::endl;
 		} else {
-			std::cout<<"have not pose"<<std::endl;
+			std::cout<<"has not pose"<<std::endl;
+			continue;
 		}
 		std::cout << std::endl;
+		result.Views.emplace_back(view);
 	}
 
-	//// Get intrinsic calibration matrix composed from focal length and principal
-	//// point parameters, excluding distortion parameters.
-	//Eigen::Matrix3d CalibrationMatrix() const; in reconstruction.Cameras()
-	//!!!
-	float kdata[] = { result.Focal, 0, 0.5f * result.W,
-		0, result.Focal, 0.5f * result.H,
-		0, 0, 1 };
-	result.K = torch::from_blob(kdata, { 3, 3 }, torch::kFloat32).clone().detach();
-	std::cout << "K: " << result.K << std::endl;
-	//result.K = GetCalibrationMatrix(result.Focal, result.W, result.H);
-	//auto bounds = GetBoundsForObj(result);			///!!!Можно придумать что-то поизящнее чем просто найти максимальную дистанцию между камерами, например, привязаться к параметрам камеры, оценить из имеющейся разреженной реконструкции
-	//result.Near = bounds.first;
-	//result.Far = bounds.second;
-	auto [global_near, global_far] = ComputeGlobalNearFar(reconstruction, 0.f, 0.95f);
-	result.Near = global_near;
-	result.Far = global_far;
-	result.BoundingBox = GetBbox3dForObj(result);		//(train_poses, result.H, result.W, /*near =*/ 2.0f, /*far =*/ 6.0f);
-	//auto colmap_bb = reconstruction.ComputeBoundingBox(0.01, 0.99);
-	//torch::Tensor min_bound = torch::tensor({ (float)colmap_bb.first.x(), (float)colmap_bb.first.y(), (float)colmap_bb.first.z() }),
-	//	max_bound = torch::tensor({ (float)colmap_bb.second.x(), (float)colmap_bb.second.y(), (float)colmap_bb.second.z() }),
-	//	d = torch::norm(max_bound - min_bound);
-	//result.BoundingBox = torch::cat({ min_bound - d * 0.05, max_bound + d * 0.05}, -1);//GetBbox3dForObj(result);
-	std::cout << "result.BoundingBox: " << result.BoundingBox <<"; Near: "<< result.Near <<"; Far: "<< result.Far << std::endl;
+	//result.BoundingBox = GetBbox3dForObj(result);		//(train_poses, result.H, result.W, /*near =*/ 2.0f, /*far =*/ 6.0f);
+	auto colmap_bb = reconstruction.ComputeBoundingBox(0.005, 0.995);
+	torch::Tensor min_bound = torch::tensor({ (float)colmap_bb.first.x(), (float)colmap_bb.first.y(), (float)colmap_bb.first.z() }),
+		max_bound = torch::tensor({ (float)colmap_bb.second.x(), (float)colmap_bb.second.y(), (float)colmap_bb.second.z() });
+	auto d = torch::norm(max_bound - min_bound);
+	result.BoundingBox = torch::cat({ min_bound - d * 0.01, max_bound + d * 0.01 }, -1);
+	std::cout << "result.BoundingBox: " << result.BoundingBox << std::endl;
 	return result;
 }

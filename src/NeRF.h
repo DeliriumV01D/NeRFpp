@@ -20,7 +20,7 @@ protected:
 	std::vector<float> FreqBands;
 public:
 	EmbedderImpl(const std::string &module_name, int multires)
-		: EmbedderImpl(module_name, multires, multires - 1){}
+		: EmbedderImpl(module_name, multires, float(multires - 1)){}
 	EmbedderImpl(const std::string &module_name, int num_freqs, float max_freq_log2, bool include_input = true, int input_dims = 3, bool log_sampling = true);
 	virtual ~EmbedderImpl() {}
 	virtual int GetOutputDims() override { return OutputDims; }
@@ -118,7 +118,7 @@ public:
 		const std::string &module_name,
 		const int input_dim = 3,
 		const int degree = 4
-	) : BaseEmbedderImpl(module_name), InputDim(input_dim), Degree(degree), OutputDims(pow(degree, 2))
+	) : BaseEmbedderImpl(module_name), InputDim(input_dim), Degree(degree), OutputDims((int)pow(degree, 2))
 	{
 		//assert input_dim == 3
 		//assert degree >= 1 && self.degree <= 5

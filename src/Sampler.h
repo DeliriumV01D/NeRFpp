@@ -19,8 +19,7 @@ inline torch::Tensor SamplePDF(torch::Tensor bins, torch::Tensor weights, const 
 	{
 		u = torch::linspace(0.f, 1.f, nsamples, torch::kFloat);
 		u = u.expand(sz);
-	}
-	else {
+	} else {
 		u = torch::rand(sz);
 	}
 

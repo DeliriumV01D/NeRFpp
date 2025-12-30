@@ -346,7 +346,7 @@ PyramidEmbedding PyramidEmbedder :: operator()(const NeRFDatasetParams &data)
 	HorPosIdx = 0;
 	VertPosIdx = 0;
 	DataImageIdx = 0;
-	DataImage = cv::imread(data.ImagePaths[DataImageIdx].string(), cv::IMREAD_COLOR/*cv::IMREAD_UNCHANGED*/);
+	DataImage = cv::imread(data.Views[DataImageIdx].ImagePath.string(), cv::IMREAD_COLOR/*cv::IMREAD_UNCHANGED*/);
 
 	while (true)
 	{
@@ -382,8 +382,8 @@ std::tuple<int, int, int, int, cv::Mat> PyramidEmbedder :: GetNextSample(const N
 		window_rect.width = Properties.ImgSize.width * pow(2, ZoomOutIdx);
 		window_rect.height = Properties.ImgSize.height * pow(2, ZoomOutIdx);
 
-		int h = data.H,
-			w = data.W;
+		int h = data.Views[DataImageIdx].H,
+			w = data.Views[DataImageIdx].W;
 
 		int nw = static_cast<int>((w - window_rect.width * Properties.Overlap)/(window_rect.width * (1. - Properties.Overlap)));
 		int nh = static_cast<int>((h - window_rect.height * Properties.Overlap)/(window_rect.height * (1. - Properties.Overlap)));
@@ -439,8 +439,8 @@ std::tuple<int, int, int, int, cv::Mat> PyramidEmbedder :: GetNextSample(const N
 
 					//Цикл по сэмплам датасета
 					DataImageIdx++; //RandomInt() % data.Imgs.size();
-					if (DataImageIdx < data.ImagePaths.size())
-						DataImage = cv::imread(data.ImagePaths[DataImageIdx].string(), cv::IMREAD_COLOR/*cv::IMREAD_UNCHANGED*/);
+					if (DataImageIdx < data.Views.size())
+						DataImage = cv::imread(data.Views[DataImageIdx].ImagePath.string(), cv::IMREAD_COLOR/*cv::IMREAD_UNCHANGED*/);
 					else
 						DataImage = cv::Mat();
 				}

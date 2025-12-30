@@ -28,5 +28,6 @@ void ColmapReconstruction(	const std::filesystem::path &image_path, const std::f
 //);
 
 
+
 ///Чтение параметров камер из базы данных colmap реконструкции
 NeRFDatasetParams LoadFromColmapReconstruction( const std::filesystem::path &workspace_path);

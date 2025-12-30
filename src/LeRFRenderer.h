@@ -20,9 +20,10 @@ struct LeRFRendererOutputs {
 
 struct LeRFRenderResult
 {
-	LeRFRendererOutputs Outputs1,		///Comes from fine model.
-		Outputs0;					///Output for coarse model.
+	LeRFRendererOutputs Outputs;		///Comes from model
 	torch::Tensor Raw;	///[num_rays, num_samples, lang_embed_dim] .Raw predictions from model.
+	float Near,
+		Far;
 };
 
 ////test
@@ -57,7 +58,6 @@ class LeRFRenderer {
 protected:
 	CuHashEmbedder LangEmbedFn = nullptr;
 	LeRF Lerf = nullptr;
-	LeRF LerfFine = nullptr;										///"fine" network with same spec as Lerf.
 	torch::Tensor LerfPositives, 
 		LerfNegatives;
 
@@ -77,10 +77,9 @@ public:
 	LeRFRenderer(
 		CuHashEmbedder lang_embed_fn,
 		LeRF lerf,
-		LeRF lerf_fine,
 		torch::Tensor lerf_positives = torch::Tensor(), 
 		torch::Tensor lerf_negatives = torch::Tensor()
-	) : LangEmbedFn (lang_embed_fn), Lerf(lerf), LerfFine(lerf_fine), LerfPositives(lerf_positives), LerfNegatives(lerf_negatives) {};
+	) : LangEmbedFn (lang_embed_fn), Lerf(lerf), LerfPositives(lerf_positives), LerfNegatives(lerf_negatives) {};
 	virtual ~LeRFRenderer(){};
 
 	std::tuple<torch::Tensor, torch::Tensor> GetLeRFPrompts(){ return std::make_tuple(LerfPositives, LerfNegatives); };
@@ -89,6 +88,7 @@ public:
 	///Volumetric rendering.
 	virtual LeRFRenderResult RenderRays(
 		torch::Tensor ray_batch,		///All information necessary for sampling along a ray, including : ray origin, ray direction, min dist, max dist, and unit - magnitude viewing direction.
+		torch::Tensor cone_angle,
 		const int n_samples,
 		const bool return_raw = false,					///If True, include model's raw, unprocessed predictions.
 		const bool lin_disp = false,						///If True, sample linearly in inverse depth rather than in depth.
@@ -106,6 +106,7 @@ public:
 	///rays_flat.sizes()[0] должно быть кратно размеру chunk
 	virtual LeRFRenderResult BatchifyRays(
 		torch::Tensor rays_flat,								///All information necessary for sampling along a ray, including : ray origin, ray direction, min dist, max dist, and unit - magnitude viewing direction.
+		torch::Tensor cone_angle,
 		const int n_samples,
 		const int chunk = 1024 * 32,						///Maximum number of rays to process simultaneously.Used to control maximum memory usage.Does not affect final results.
 		const bool return_raw = false,					///If True, include model's raw, unprocessed predictions.
@@ -125,7 +126,7 @@ public:
 		const int w,					///Width of image in pixels.
 		torch::Tensor k,			///Сamera calibration
 		const NeRFRenderParams &render_params,
-		std::pair<torch::Tensor, torch::Tensor> rays = { torch::Tensor(), torch::Tensor() },			///array of shape[2, batch_size, 3].Ray origin and direction for each example in batch.
+		std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rays = { torch::Tensor(), torch::Tensor(), torch::Tensor() },			///array of shape[2, batch_size, 3].Ray origin and direction for each example in batch.
 		torch::Tensor c2w = torch::Tensor(),			///array of shape[3, 4].Camera - to - world transformation matrix.
 		torch::Tensor c2w_staticcam = torch::Tensor()			///array of shape[3, 4].If not None, use this transformation matrix for camera while using other c2w argument for viewing directions.
 	);

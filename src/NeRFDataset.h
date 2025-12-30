@@ -12,12 +12,13 @@
 #include <opencv2/highgui/highgui.hpp>
 
 
-
-
 ///Структура для хранения лучей
 struct RayBatch {
 	torch::Tensor rays_o;
 	torch::Tensor rays_d;
+	torch::Tensor cone_angle;
+	float near;
+	float far;
 };
 
 ///Структура для хранения таргетов
@@ -76,7 +77,7 @@ public:
 	);
 
 	///
-	std::pair<torch::Tensor, torch::Tensor> GetRayBatch(
+	std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> GetRayBatch(
 		const torch::Tensor &rand_h,
 		const torch::Tensor &rand_w,
 		int H,

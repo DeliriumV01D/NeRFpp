@@ -248,7 +248,7 @@ HashEmbedderImpl :: HashEmbedderImpl(
 ) : BaseEmbedderImpl(module_name), BoundingBox(bounding_box), NLevels(n_levels), NFeaturesPerLevel(n_features_per_level), Log2HashmapSize(log2_hashmap_size),
 BaseResolution(base_resolution), FinestResolution(finest_resolution), OutputDims(n_levels* n_features_per_level)
 {
-	b = exp((log(finest_resolution) - log(base_resolution)) / (n_levels - 1));
+	b = static_cast<float>(exp((log(finest_resolution) - log(base_resolution)) / (n_levels - 1)));
 
 	//Embedding is a simple lookup table that stores embeddings of a fixed dictionaryand size.
 	//This module is often used to store word embeddingsand retrieve them using indices.The input to the module is a list of indices, and the output is the corresponding word embeddings.

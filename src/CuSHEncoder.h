@@ -14,7 +14,7 @@ public:
 		const std::string &module_name,
 		const int input_dim = 3,
 		const int degree = 4
-	) : BaseEmbedderImpl(module_name), InputDim(input_dim), Degree(degree), OutputDims(pow(degree, 2))
+	) : BaseEmbedderImpl(module_name), InputDim(input_dim), Degree(degree), OutputDims((int)powf((float)degree, 2))
 	{
 		//assert input_dim == 3
 		//assert degree >= 1 && self.degree <= 5

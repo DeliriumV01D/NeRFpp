@@ -28,7 +28,7 @@ int NeRFDataset :: GetRandomTrainIdx()
 
 torch::Tensor NeRFDataset :: LoadImage(const int idx) const
 {
-	const auto &path = Params.ImagePaths[idx];
+	const auto &path = Params.Views[idx].ImagePath;
 	cv::Mat img = cv::imread(path.string(), cv::IMREAD_COLOR/*cv::IMREAD_UNCHANGED*/);		//keep all 4 channels(RGBA)
 	if (img.empty())
 		throw std::runtime_error("NeRFDataset :: LoadImage error: Failed to load image: " + path.string());
@@ -43,21 +43,23 @@ void NeRFDataset :: PrefetchNextImage()
 
 std::tuple<int, int, int, int> NeRFDataset :: CalculateBounds() const
 {
-	int h_start, h_end, w_start, w_end;
+	int h_start, h_end, w_start, w_end,
+		h = Params.Views[CurrentImageIdx].H,
+		w = Params.Views[CurrentImageIdx].W;
 	if (CurrentIter < PrecorpIters)
 	{
-		int dh = static_cast<int>(Params.H / 2 * PrecorpFrac);
-		int dw = static_cast<int>(Params.W / 2 * PrecorpFrac);
-		h_start = Params.H / 2 - dh;
-		h_end = Params.H / 2 + dh - 1;
-		w_start = Params.W / 2 - dw;
-		w_end = Params.W / 2 + dw - 1;
+		int dh = static_cast<int>(h / 2 * PrecorpFrac);
+		int dw = static_cast<int>(w / 2 * PrecorpFrac);
+		h_start = h / 2 - dh;
+		h_end = h / 2 + dh - 1;
+		w_start = w / 2 - dw;
+		w_end = w / 2 + dw - 1;
 	}
 	else {
 		h_start = 0;
-		h_end = Params.H - 1;
+		h_end = h - 1;
 		w_start = 0;
-		w_end = Params.W - 1;
+		w_end = w - 1;
 	}
 	return { h_start, h_end, w_start, w_end };
 }
@@ -72,7 +74,16 @@ void NeRFDataset :: InitializePyramidClipEmbedding()
 			pyramid_embedder_properties.Overlap = LeRFParams.pyr_embedder_overlap;										///Доля перекрытия
 			pyramid_embedder_properties.MinZoomOut = LeRFParams.MinZoomOut;		//0 or -1
 			///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0 , 1, 2...
-			pyramid_embedder_properties.MaxZoomOut = std::min(log2f(Params.W / LeRFParams.clip_input_img_size), log2f(Params.H / LeRFParams.clip_input_img_size));
+			int wmax = 0,
+				hmax = 0;
+			for (auto &view : Params.Views)
+			{
+				if (view.H > hmax)
+					hmax = view.H;
+				if (view.W > wmax)
+					wmax = view.W;
+			}
+			pyramid_embedder_properties.MaxZoomOut = std::min(log2f(wmax / LeRFParams.clip_input_img_size), log2f(hmax / LeRFParams.clip_input_img_size));
 			PyramidEmbedder PyramidClipEmbedder(Clip, ClipProcessor, pyramid_embedder_properties);
 
 			if (!std::filesystem::exists(LeRFParams.PyramidClipEmbeddingSaveDir / "pyramid_embeddings.pt"))
@@ -95,7 +106,7 @@ void NeRFDataset :: InitializePyramidClipEmbedding()
 
 
 ///
-std::pair<torch::Tensor, torch::Tensor> NeRFDataset :: GetRayBatch(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> NeRFDataset :: GetRayBatch(
 	const torch::Tensor &rand_h,
 	const torch::Tensor &rand_w,
 	int H,
@@ -120,21 +131,30 @@ std::pair<torch::Tensor, torch::Tensor> NeRFDataset :: GetRayBatch(
 		-1);  //dot product, equals to : [c2w.dot(dir) for dir in dirs]
 	//Translate camera frame's origin to the world frame. It is the origin of all rays.
 	auto rays_o = c2w.index({ torch::indexing::Slice(torch::indexing::None, 3), -1 }).expand(rays_d.sizes());
-	return { rays_o, rays_d };
+
+	//Вычисляем угловой размер пикселя в мировых координатах. Производная радиуса конуса = (размер пикселя) / (фокусное расстояние)
+	//Размер пикселя в мировых координатах на расстоянии 1
+	auto pixel_size_x = 1.0 / fx;
+	auto pixel_size_y = 1.0 / fy;
+	auto avg_pixel_size = (pixel_size_x + pixel_size_y) / 2.0;
+	//Производная радиуса конуса = угловой размер пикселя. При расстоянии d, радиус конуса cone_ridius = d * pixel_size
+	auto cone_angle = avg_pixel_size /** torch::ones({ h, w, 1 }, rays_d.options())*/;
+
+	return { rays_o, rays_d, cone_angle };
 }
 
 
 ///
-NeRFDataExample  NeRFDataset :: get_batch(std::vector<size_t> request/*Не используется*/)
+NeRFDataExample NeRFDataset :: get_batch(std::vector<size_t> request/*Не используется*/)
 {
-	torch::Tensor pose = Params.Poses[CurrentImageIdx].to(Device);		//Получаем позу для текущего изображения
+	torch::Tensor pose = Params.Views[CurrentImageIdx].Pose.to(Device);		//Получаем позу для текущего изображения
 	auto [h_start, h_end, w_start, w_end] = CalculateBounds();		//Вычисляем границы кадрирования
 	//Прямая генерация случайных координат
 	auto options = torch::TensorOptions().dtype(torch::kLong).device(Device);
 	torch::Tensor rand_h = torch::randint(h_start, h_end + 1, { BatchSize }, options);
 	torch::Tensor rand_w = torch::randint(w_start, w_end + 1, { BatchSize }, options);
 	torch::Tensor target_s = CurrentImage.index({ rand_h, rand_w });		//Извлекаем цвета пикселей
-	auto [rays_o, rays_d] = GetRayBatch(rand_h, rand_w, Params.H, Params.W, Params.K.to(Device), pose);		//Вычисляем лучи
+	auto [rays_o, rays_d, cone_angle] = GetRayBatch(rand_h, rand_w, Params.Views[CurrentImageIdx].H, Params.Views[CurrentImageIdx].W, Params.Views[CurrentImageIdx].K.to(Device), pose);		//Вычисляем лучи
 
 	//!!!->class LeRFDataset
 	///Вычислим CLIP эмбеддинги в точках изображения которые попали в батч
@@ -146,7 +166,16 @@ NeRFDataExample  NeRFDataset :: get_batch(std::vector<size_t> request/*Не ис
 		pyramid_embedder_properties.Overlap = LeRFParams.pyr_embedder_overlap;										///Доля перекрытия
 		pyramid_embedder_properties.MinZoomOut = LeRFParams.MinZoomOut;
 		///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0, 1, 2...
-		pyramid_embedder_properties.MaxZoomOut = std::min(log2f(Params.W / LeRFParams.clip_input_img_size), log2f(Params.H / LeRFParams.clip_input_img_size));
+		int wmax = 0,
+			hmax = 0;
+		for (auto &view : Params.Views)
+		{
+			if (view.H > hmax)
+				hmax = view.H;
+			if (view.W > wmax)
+				wmax = view.W;
+		}
+		pyramid_embedder_properties.MaxZoomOut = std::min(log2f(wmax / LeRFParams.clip_input_img_size), log2f(hmax / LeRFParams.clip_input_img_size));
 		//auto select_coords_cpu = select_coords.to(torch::kCPU).to(torch::kFloat);		//!!!.item<long>()почему то не находит поэтому преобразуем во float
 		target_lang_embedding = torch::ones({ BatchSize, LeRFParams.lang_embed_dim }, torch::kFloat32);
 
@@ -159,7 +188,7 @@ NeRFDataExample  NeRFDataset :: get_batch(std::vector<size_t> request/*Не ис
 				0.5f,		///!!!ПРИВЯЗАТЬСЯ К МАСШТАБУ для этого перенести в RunNetwork по аналогии с calculated_normals			//Get zoom_out_idx from scale //-1, 0, 1, 2 ... <- 1/2, 1, 2, 4 ...
 				CurrentImageIdx,
 				pyramid_embedder_properties,
-				cv::Size(Params.W, Params.H)
+				cv::Size(Params.Views[CurrentImageIdx].W, Params.Views[CurrentImageIdx].H)
 			));
 		}
 	}		//if use_lerf
@@ -175,5 +204,5 @@ NeRFDataExample  NeRFDataset :: get_batch(std::vector<size_t> request/*Не ис
 		}
 	}
 
-	return { {rays_o, rays_d}, {target_s, target_lang_embedding} };
+	return { {rays_o, rays_d, cone_angle, Params.Views[CurrentImageIdx].Near, Params.Views[CurrentImageIdx].Far}, {target_s, target_lang_embedding} };
 }

@@ -34,7 +34,7 @@ LeRFRendererOutputs LeRFRenderer :: RawToLEOutputs(
 	torch::Device device = raw_le.device();
 	LeRFRendererOutputs result;
 
-	auto raw2alpha = [](torch::Tensor raw, torch::Tensor dists) {return -torch::exp(-torch::relu(raw) * dists) + 1.f; };
+	auto raw2alpha = [](torch::Tensor raw, torch::Tensor dists) {return -torch::autograd::TruncExp::apply(-torch::relu(raw) * dists)[0] + 1.f;};
 
 	auto dists_le = z_vals_le.index({ "...", torch::indexing::Slice(1, torch::indexing::None) }) - z_vals_le.index({ "...", torch::indexing::Slice(torch::indexing::None, -1) });
 	dists_le = torch::cat({ dists_le, (torch::ones(1, torch::kFloat32) * 1e10).expand(dists_le.index({ "...", torch::indexing::Slice(torch::indexing::None, 1) }).sizes()).to(device)}, -1);  // [N_rays, N_samples]
@@ -45,18 +45,29 @@ LeRFRendererOutputs LeRFRenderer :: RawToLEOutputs(
 	int cur_pos = 0;
 	result.LangEmbedding = /*torch::tanh(*/raw_le.index({ "...",  torch::indexing::Slice(cur_pos, cur_pos + lang_embed_dim) })/*)*/;
 	cur_pos += lang_embed_dim;
-		
+	
 	auto le_density_before_activation = raw_le.index({ "...", cur_pos});		//    извлекает значения (sigma_le) очередного столбца raw
 	if (raw_noise_std > 0.f)
-	{
 		le_density_before_activation = le_density_before_activation + torch::randn_like(le_density_before_activation) * raw_noise_std;
-	}	
+
 	torch::Tensor le_alpha = raw2alpha(le_density_before_activation, dists_le);  //[N_rays, N_samples]
-	result.WeightsLE = le_alpha * torch::cumprod(
-			torch::cat({ torch::ones({le_alpha.sizes()[0], 1}).to(device), -le_alpha + 1.f + 1e-10f }, -1),
-			-1
-		).index({ torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, -1) });
-	result.DepthMapLE = torch::sum(result.WeightsLE * z_vals_le, -1) / torch::sum(result.WeightsLE, -1);
+	
+	//result.WeightsLE = le_alpha * torch::cumprod(
+	//		torch::cat({ torch::ones({le_alpha.sizes()[0], 1}).to(device), -le_alpha + 1.f + 1e-10f }, -1),
+	//		-1
+	//	).index({ torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, -1) });
+	auto compute_weights_in_log_space = [](torch::Tensor alpha, torch::Device device)
+	{
+		//Вычисляем log(1 - alpha) с защитой от log(0)
+		auto log_transmittance = torch::cat({
+				torch::zeros({alpha.size(0)/*nrays*/, 1}, torch::TensorOptions().device(device)),
+				torch::cumsum(torch::log(torch::clamp_min(1.0f - alpha, 1e-10f)), -1)
+			}, -1).index({ torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, -1) });
+		auto weights = alpha * torch::autograd::TruncExp::apply(log_transmittance)[0];
+		return weights;
+	};
+	result.WeightsLE = compute_weights_in_log_space(le_alpha, device);
+	result.DepthMapLE = torch::sum(result.WeightsLE * z_vals_le, -1) / torch::clamp_min(torch::sum(result.WeightsLE, -1), 1e-10f);
 	result.DispMapLE = 1. / torch::max(1e-10 * torch::ones_like(result.DepthMapLE), result.DepthMapLE);
 	result.AccMapLE = torch::sum(result.WeightsLE, -1);
 	cur_pos += 1;
@@ -73,6 +84,7 @@ LeRFRendererOutputs LeRFRenderer :: RawToLEOutputs(
 ///Volumetric rendering.
 LeRFRenderResult LeRFRenderer :: RenderRays(
 	torch::Tensor ray_batch,		///All information necessary for sampling along a ray, including : ray origin, ray direction, min dist, max dist, and unit - magnitude viewing direction.
+	torch::Tensor cone_angle,
 	const int n_samples,
 	const bool return_raw /*= false*/,					///If True, include model's raw, unprocessed predictions.
 	const bool lin_disp /*= false*/,						///If True, sample linearly in inverse depth rather than in depth.
@@ -89,7 +101,7 @@ LeRFRenderResult LeRFRenderer :: RenderRays(
 	torch::Device device = ray_batch.device();		//Передать параметром??
 
 	///!!!Можно просто передавать структурку не парсить тензор
-	int nrays = ray_batch.sizes()[0];
+	int nrays = (int)ray_batch.sizes()[0];
 	auto rays_o = ray_batch.index({ torch::indexing::Slice(), torch::indexing::Slice(0, 3) });			//[N_rays, 3]		Origins
 	auto rays_d = ray_batch.index({ torch::indexing::Slice(), torch::indexing::Slice(3, 6) });			//[N_rays, 3]		Directions
 	torch::Tensor viewdirs;
@@ -101,12 +113,14 @@ LeRFRenderResult LeRFRenderer :: RenderRays(
 
 	torch::Tensor t_vals = torch::linspace(0.f, 1.f, n_samples, torch::kFloat).to(device);
 	torch::Tensor z_vals;
+
 	if (!lin_disp)
 	{
-		z_vals = near * (1. - t_vals) + far * (t_vals);
-	}
-	else {
-		z_vals = 1. / (1. / near * (1. - t_vals) + 1. / far * (t_vals));
+		z_vals = near * (1.f - t_vals) + far * (t_vals);
+	} else {
+		//z_vals = 1. / (1. / near * (1. - t_vals) + 1. / far * (t_vals));
+		auto safe_inv = [](torch::Tensor x, float eps = 1e-8f) {return torch::where(torch::abs(x) < eps, torch::ones_like(x) / eps, 1.0f / x); };
+		z_vals = safe_inv(safe_inv(near) * (1. - t_vals) + safe_inv(far) * t_vals);
 	}
 
 	if (perturb > 0.)
@@ -116,19 +130,24 @@ LeRFRenderResult LeRFRenderer :: RenderRays(
 		auto upper = torch::cat({ mids, z_vals.index({ "...", torch::indexing::Slice(-1, torch::indexing::None)}) }, -1);
 		auto lower = torch::cat({ z_vals.index({ "...", torch::indexing::Slice(torch::indexing::None, 1)}), mids }, -1);
 		//stratified samples in those intervals
-		auto t_rand = torch::rand(z_vals.sizes());
-		z_vals = lower + (upper - lower) * t_rand;
+		//auto t_rand = torch::rand(z_vals.sizes());
+		//z_vals = lower + (upper - lower) * t_rand;
+		auto intervals = upper - lower;
+		auto mask = intervals > 1e-8f;
+		auto t_rand = torch::rand(z_vals.sizes(), device = device);
+		z_vals = lower + torch::where(mask, intervals * t_rand, torch::zeros_like(intervals));
 	}
 
 	auto pts = rays_o.index({ "...", torch::indexing::None, torch::indexing::Slice() }) + rays_d.index({ "...", torch::indexing::None, torch::indexing::Slice() }) * z_vals.index({ "...", torch::indexing::Slice(), torch::indexing::None}); //[N_rays, N_samples, 3]
+	pts = TangentScatter(pts, z_vals, cone_angle, rays_d, device, bounding_box);
+
 	torch::Tensor raw =  RunLENetwork(pts, Lerf, LangEmbedFn);
-	lerf_result.Outputs1 = RawToLEOutputs(raw, z_vals, rays_d, Lerf->GetLangEmbedDim(), raw_noise_std);
+	auto outputs1 = RawToLEOutputs(raw, z_vals, rays_d, Lerf->GetLangEmbedDim(), raw_noise_std);
 
 	if (n_importance > 0)
 	{
-		lerf_result.Outputs0 = lerf_result.Outputs1;
 		auto z_vals_mid = .5 * (z_vals.index({ "...", torch::indexing::Slice(1, torch::indexing::None) }) + z_vals.index({ "...", torch::indexing::Slice(torch::indexing::None, -1) }));
-		auto z_samples = SamplePDF(z_vals_mid, lerf_result.Outputs1.WeightsLE.index({ "...", torch::indexing::Slice(1, -1) }), n_importance, perturb == 0.);
+		auto z_samples = SamplePDF(z_vals_mid, outputs1.WeightsLE.index({ "...", torch::indexing::Slice(1, -1) }), n_importance, perturb == 0.);
 		z_samples = z_samples.detach();
 		torch::Tensor z_indices;
 		std::tie(z_vals, z_indices) = torch::sort(torch::cat({ z_vals, z_samples }, -1), -1);
@@ -145,27 +164,21 @@ LeRFRenderResult LeRFRenderer :: RenderRays(
 			pts = ReflectBoundary(pts, min_bound, max_bound);	//Обрабатываем границы отражением
 		}
 
-		if (!LerfFine /*!= nullptr*/)
-		{
-			raw = RunLENetwork(pts, Lerf, LangEmbedFn);
-		}	else {
-			raw = RunLENetwork(pts, LerfFine, LangEmbedFn);
-		}
-		lerf_result.Outputs1 = RawToLEOutputs(raw, z_vals, rays_d, Lerf->GetLangEmbedDim(), raw_noise_std);
+		pts = TangentScatter(pts, z_vals, cone_angle, rays_d, device, bounding_box);
+
+		raw = RunLENetwork(pts, Lerf, LangEmbedFn);
+		lerf_result.Outputs = RawToLEOutputs(raw, z_vals, rays_d, Lerf->GetLangEmbedDim(), raw_noise_std);
 		//result.ZStd = torch::std(z_samples, -1, false);  // [N_rays]
-	}
+	}		//if (n_importance > 0)
 
 	if (return_raw)
 		lerf_result.Raw = raw;
 
 	if (!return_weights)
 	{
-		lerf_result.Outputs0.WeightsLE = torch::Tensor();
-		lerf_result.Outputs1.WeightsLE = torch::Tensor();
-		lerf_result.Outputs0.LangEmbedding = torch::Tensor();
-		lerf_result.Outputs1.LangEmbedding = torch::Tensor();
-		lerf_result.Outputs0.RenderedLangEmbedding = torch::Tensor();
-		lerf_result.Outputs1.RenderedLangEmbedding = torch::Tensor();
+		lerf_result.Outputs.WeightsLE = torch::Tensor();
+		lerf_result.Outputs.LangEmbedding = torch::Tensor();
+		lerf_result.Outputs.RenderedLangEmbedding = torch::Tensor();
 	}
 	return lerf_result;
 }
@@ -175,6 +188,7 @@ LeRFRenderResult LeRFRenderer :: RenderRays(
 ///rays_flat.sizes()[0] должно быть кратно размеру chunk
 LeRFRenderResult LeRFRenderer :: BatchifyRays(
 	torch::Tensor rays_flat,								///All information necessary for sampling along a ray, including : ray origin, ray direction, min dist, max dist, and unit - magnitude viewing direction.
+	torch::Tensor cone_angle,
 	const int n_samples,
 	const int chunk /*= 1024 * 32*/,						///Maximum number of rays to process simultaneously.Used to control maximum memory usage.Does not affect final results.
 	const bool return_raw /*= false*/,					///If True, include model's raw, unprocessed predictions.
@@ -194,6 +208,7 @@ LeRFRenderResult LeRFRenderer :: BatchifyRays(
 	{
 		all_results.emplace_back(RenderRays(
 			rays_flat.index({ torch::indexing::Slice(i, ((i + chunk) <= rays_flat.sizes()[0])?(i+chunk):(rays_flat.sizes()[0])) }),
+			cone_angle,/*пока скаляр, потом .index({ torch::indexing::Slice(i, ((i + chunk) <= cone_angle.sizes()[0]) ? (i + chunk) : (cone_angle.sizes()[0])) }),*/
 			n_samples,
 			return_raw,
 			lin_disp,
@@ -225,36 +240,22 @@ LeRFRenderResult LeRFRenderer :: BatchifyRays(
 		raw;
 	for (auto it : all_results)
 	{
-		if (it.Outputs1.DispMapLE.defined()) out_disp_map_le.push_back(it.Outputs1.DispMapLE);
-		if (it.Outputs1.AccMapLE.defined()) out_acc_map_le.push_back(it.Outputs1.AccMapLE);
-		if (it.Outputs1.WeightsLE.defined()) out_weights_le.push_back(it.Outputs1.WeightsLE);
-		if (it.Outputs1.DepthMapLE.defined()) out_depth_map_le.push_back(it.Outputs1.DepthMapLE);
-		if (it.Outputs1.LangEmbedding.defined()) out_lang_embedding.push_back(it.Outputs1.LangEmbedding);
-		if (it.Outputs1.RenderedLangEmbedding.defined()) out_rendered_lang_embedding.push_back(it.Outputs1.RenderedLangEmbedding);
-		if (it.Outputs1.Relevancy.defined()) out_relevancy.push_back(it.Outputs1.Relevancy);
-		if (it.Outputs0.DispMapLE.defined()) out0_disp_map_le.push_back(it.Outputs0.DispMapLE);
-		if (it.Outputs0.AccMapLE.defined()) out0_acc_map_le.push_back(it.Outputs0.AccMapLE);
-		if (it.Outputs0.WeightsLE.defined()) out0_weights_le.push_back(it.Outputs0.WeightsLE);
-		if (it.Outputs0.DepthMapLE.defined()) out0_depth_map_le.push_back(it.Outputs0.DepthMapLE);
-		if (it.Outputs0.LangEmbedding.defined()) out0_lang_embedding.push_back(it.Outputs0.LangEmbedding);
-		if (it.Outputs0.RenderedLangEmbedding.defined()) out0_rendered_lang_embedding.push_back(it.Outputs0.RenderedLangEmbedding);
-		if (it.Outputs0.Relevancy.defined()) out0_relevancy.push_back(it.Outputs0.Relevancy);
+		if (it.Outputs.DispMapLE.defined()) out_disp_map_le.push_back(it.Outputs.DispMapLE);
+		if (it.Outputs.AccMapLE.defined()) out_acc_map_le.push_back(it.Outputs.AccMapLE);
+		if (it.Outputs.WeightsLE.defined()) out_weights_le.push_back(it.Outputs.WeightsLE);
+		if (it.Outputs.DepthMapLE.defined()) out_depth_map_le.push_back(it.Outputs.DepthMapLE);
+		if (it.Outputs.LangEmbedding.defined()) out_lang_embedding.push_back(it.Outputs.LangEmbedding);
+		if (it.Outputs.RenderedLangEmbedding.defined()) out_rendered_lang_embedding.push_back(it.Outputs.RenderedLangEmbedding);
+		if (it.Outputs.Relevancy.defined()) out_relevancy.push_back(it.Outputs.Relevancy);
 		if (it.Raw.defined()) raw.push_back(it.Raw);
 	}
-	if (!out_disp_map_le.empty()) result.Outputs1.DispMapLE = torch::cat(out_disp_map_le, 0);
-	if (!out_acc_map_le.empty()) result.Outputs1.AccMapLE = torch::cat(out_acc_map_le, 0);
-	if (!out_weights_le.empty()) result.Outputs1.WeightsLE = torch::cat(out_weights_le, 0);
-	if (!out_depth_map_le.empty()) result.Outputs1.DepthMapLE = torch::cat(out_depth_map_le, 0);
-	if (!out_lang_embedding.empty()) result.Outputs1.LangEmbedding = torch::cat(out_lang_embedding, 0);
-	if (!out_rendered_lang_embedding.empty()) result.Outputs1.RenderedLangEmbedding = torch::cat(out_rendered_lang_embedding, 0);
-	if (!out_relevancy.empty()) result.Outputs1.Relevancy = torch::cat(out_relevancy, 0);
-	if (!out0_disp_map_le.empty()) result.Outputs0.DispMapLE = torch::cat(out0_disp_map_le, 0);
-	if (!out0_acc_map_le.empty()) result.Outputs0.AccMapLE = torch::cat(out0_acc_map_le, 0);
-	if (!out0_weights_le.empty()) result.Outputs0.WeightsLE = torch::cat(out0_weights_le, 0);
-	if (!out0_depth_map_le.empty()) result.Outputs0.DepthMapLE = torch::cat(out0_depth_map_le, 0);
-	if (!out0_lang_embedding.empty()) result.Outputs0.LangEmbedding = torch::cat(out0_lang_embedding, 0);
-	if (!out0_rendered_lang_embedding.empty()) result.Outputs0.RenderedLangEmbedding = torch::cat(out0_rendered_lang_embedding, 0);
-	if (!out0_relevancy.empty()) result.Outputs0.Relevancy = torch::cat(out0_relevancy, 0);
+	if (!out_disp_map_le.empty()) result.Outputs.DispMapLE = torch::cat(out_disp_map_le, 0);
+	if (!out_acc_map_le.empty()) result.Outputs.AccMapLE = torch::cat(out_acc_map_le, 0);
+	if (!out_weights_le.empty()) result.Outputs.WeightsLE = torch::cat(out_weights_le, 0);
+	if (!out_depth_map_le.empty()) result.Outputs.DepthMapLE = torch::cat(out_depth_map_le, 0);
+	if (!out_lang_embedding.empty()) result.Outputs.LangEmbedding = torch::cat(out_lang_embedding, 0);
+	if (!out_rendered_lang_embedding.empty()) result.Outputs.RenderedLangEmbedding = torch::cat(out_rendered_lang_embedding, 0);
+	if (!out_relevancy.empty()) result.Outputs.Relevancy = torch::cat(out_relevancy, 0);
 	if (!raw.empty()) result.Raw = torch::cat(raw, 0);
 
 	return result;
@@ -266,73 +267,65 @@ LeRFRenderResult LeRFRenderer :: Render(
 	const int w,					///Width of image in pixels.
 	torch::Tensor k,			///Сamera calibration
 	const NeRFRenderParams &render_params,
-	std::pair<torch::Tensor, torch::Tensor> rays /*= { torch::Tensor(), torch::Tensor() }*/,			///array of shape[2, batch_size, 3].Ray origin and direction for each example in batch.
+	std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rays /*= { torch::Tensor(), torch::Tensor(), torch::Tensor() }*/,			///array of shape[2, batch_size, 3].Ray origin and direction for each example in batch.
 	torch::Tensor c2w /*= torch::Tensor()*/,			///array of shape[3, 4].Camera - to - world transformation matrix.
 	torch::Tensor c2w_staticcam /*= torch::Tensor()*/			///array of shape[3, 4].If not None, use this transformation matrix for camera while using other c2w argument for viewing directions.
 ) {
-	torch::Tensor rays_o, rays_d;
+	torch::Tensor rays_o, rays_d, cone_angle;
 	if (c2w.defined() && c2w.numel() != 0)
 	{
 		//special case to render full image
-		std::tie(rays_o, rays_d) = GetRays(h, w, k, c2w);
+		std::tie(rays_o, rays_d, cone_angle) = GetRays(h, w, k, c2w);
 	}	else {
 		//use provided ray batch
-		std::tie(rays_o, rays_d) = rays;
+		std::tie(rays_o, rays_d, cone_angle) = rays;
 	}
 
 	auto sh = rays_d.sizes();			//[..., 3]
 	if (render_params.Ndc)
 	{
 		//for forward facing scenes
-		std::tie(rays_o, rays_d) = NDCRays(h, w, k[0][0].item<float>()/*focal*/, 1.f, rays_o, rays_d);
+		std::tie(rays_o, rays_d, cone_angle) = NDCRays(h, w, k[0][0].item<float>()/*focal*/, 1.f, rays_o, rays_d, render_params.ThinRay ? torch::Tensor() : cone_angle);
 	}
 
 	//Create ray batch
 	rays_o = torch::reshape(rays_o, { -1, 3 });//.float()
 	rays_d = torch::reshape(rays_d, { -1, 3 });//.float()
 
-	auto near_ = render_params.Near * torch::ones_like(rays_d.index({ "...", torch::indexing::Slice(torch::indexing::None, 1) }));
-	auto far_ = render_params.Far * torch::ones_like(rays_d.index({ "...", torch::indexing::Slice(torch::indexing::None, 1) }));
+	//Calculate individual near and far for each ray using AABB intersection
+	torch::Tensor near_, far_;
+	std::tie(near_, far_) = IntersectWithAABB(rays_o, rays_d, render_params.BoundingBox, 0.f/*near*/);
+	near_ = near_.unsqueeze(-1);  // Shape: [num_rays, 1]
+	far_ = far_.unsqueeze(-1);    // Shape: [num_rays, 1]
+
 	auto rays_ = torch::cat({ rays_o, rays_d, near_, far_ }, -1);
 	
 	//Render and reshape
 	LeRFRenderResult all_ret = std::move(BatchifyRays(
-		rays_, 
-		render_params.NSamples, render_params.Chunk, render_params.ReturnRaw, render_params.LinDisp, render_params.Perturb,
+		rays_, render_params.ThinRay ? torch::Tensor() : cone_angle, render_params.NSamples, render_params.Chunk, render_params.ReturnRaw, render_params.LinDisp, render_params.Perturb,
 		render_params.NImportance, render_params.WhiteBkgr, render_params.RawNoiseStd, render_params.StochasticPreconditioningAlpha, render_params.BoundingBox, render_params.ReturnWeights
 	));
 
 	if (sh.size() > 2)			//не [4096, 3] а [800,800,3]
 	{
-		if (all_ret.Outputs1.DispMapLE.numel() != 0)
-			all_ret.Outputs1.DispMapLE = torch::reshape(all_ret.Outputs1.DispMapLE, { sh[0], sh[1] });	//[640000] -> [800,800]
-		if (all_ret.Outputs0.DispMapLE.numel() != 0)
-			all_ret.Outputs0.DispMapLE = torch::reshape(all_ret.Outputs0.DispMapLE, { sh[0], sh[1] });
-		if (all_ret.Outputs1.DepthMapLE.numel() != 0)
-			all_ret.Outputs1.DepthMapLE = torch::reshape(all_ret.Outputs1.DepthMapLE, { sh[0], sh[1] });
-		if (all_ret.Outputs0.DepthMapLE.numel() != 0)
-			all_ret.Outputs0.DepthMapLE = torch::reshape(all_ret.Outputs0.DepthMapLE, { sh[0], sh[1] });
+		if (all_ret.Outputs.DispMapLE.numel() != 0)
+			all_ret.Outputs.DispMapLE = torch::reshape(all_ret.Outputs.DispMapLE, { sh[0], sh[1] });	//[640000] -> [800,800]
+		if (all_ret.Outputs.DepthMapLE.numel() != 0)
+			all_ret.Outputs.DepthMapLE = torch::reshape(all_ret.Outputs.DepthMapLE, { sh[0], sh[1] });
 
-		if (all_ret.Outputs1.RenderedLangEmbedding.numel() != 0)
-			all_ret.Outputs1.RenderedLangEmbedding = torch::reshape(all_ret.Outputs1.RenderedLangEmbedding, { sh[0], sh[1], Lerf->GetLangEmbedDim() });
-		if (all_ret.Outputs0.RenderedLangEmbedding.numel() != 0)
-			all_ret.Outputs0.RenderedLangEmbedding = torch::reshape(all_ret.Outputs0.RenderedLangEmbedding, { sh[0], sh[1], Lerf->GetLangEmbedDim() });
+		if (all_ret.Outputs.RenderedLangEmbedding.numel() != 0)
+			all_ret.Outputs.RenderedLangEmbedding = torch::reshape(all_ret.Outputs.RenderedLangEmbedding, { sh[0], sh[1], Lerf->GetLangEmbedDim() });
 
-		if (all_ret.Outputs1.Relevancy.numel() != 0)
-			all_ret.Outputs1.Relevancy = torch::reshape(all_ret.Outputs1.Relevancy, { sh[0], sh[1], 2 });
-		if (all_ret.Outputs0.Relevancy.numel() != 0)
-			all_ret.Outputs0.Relevancy = torch::reshape(all_ret.Outputs0.Relevancy, { sh[0], sh[1], 2 });
+		if (all_ret.Outputs.Relevancy.numel() != 0)
+			all_ret.Outputs.Relevancy = torch::reshape(all_ret.Outputs.Relevancy, { sh[0], sh[1], 2 });
 	} else {
-		if (all_ret.Outputs1.RenderedLangEmbedding.numel() != 0)
-			all_ret.Outputs1.RenderedLangEmbedding = torch::reshape(all_ret.Outputs1.RenderedLangEmbedding, { sh[0], Lerf->GetLangEmbedDim() });
-		if (all_ret.Outputs0.RenderedLangEmbedding.numel() != 0)
-			all_ret.Outputs0.RenderedLangEmbedding = torch::reshape(all_ret.Outputs0.RenderedLangEmbedding, { sh[0], Lerf->GetLangEmbedDim() });
+		if (all_ret.Outputs.RenderedLangEmbedding.numel() != 0)
+			all_ret.Outputs.RenderedLangEmbedding = torch::reshape(all_ret.Outputs.RenderedLangEmbedding, { sh[0], Lerf->GetLangEmbedDim() });
 
-		if (all_ret.Outputs1.Relevancy.numel() != 0)
-			all_ret.Outputs1.Relevancy = torch::reshape(all_ret.Outputs1.Relevancy, { sh[0], 2 });
-		if (all_ret.Outputs0.Relevancy.numel() != 0)
-			all_ret.Outputs0.Relevancy = torch::reshape(all_ret.Outputs0.Relevancy, { sh[0], 2 });
+		if (all_ret.Outputs.Relevancy.numel() != 0)
+			all_ret.Outputs.Relevancy = torch::reshape(all_ret.Outputs.Relevancy, { sh[0], 2 });
 	}
-
+	all_ret.Near = near_.min().item<float>();
+	all_ret.Far = far_.max().item<float>();
 	return all_ret;
 }

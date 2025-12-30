@@ -176,7 +176,7 @@ int main(int argc, const char* argv[])
 	//test();
 
 	NeRFExecutorParams exparams;
-	exparams.net_depth = 2;				//layers in network 8 for classic NeRF, 2/3 for HashNeRF
+	exparams.net_depth = 3;				//layers in network 8 for classic NeRF, 2/3 for HashNeRF
 	exparams.net_width = 64;				//channels per layer 256 for classic NeRF, 64 for HashNeRF
 	exparams.multires = 10;
 	exparams.use_nerf = true;
@@ -184,20 +184,17 @@ int main(int argc, const char* argv[])
 	exparams.calculate_normals = false;
 	exparams.use_pred_normal = false;	//whether to use predicted normals
 	exparams.use_lerf = false;				//use language embedded radiance fields
+	exparams.thin_ray = false;
 	exparams.multires_views = 8;		//log2 of max freq for positional encoding (2D direction)
 	exparams.n_importance = 192;//192;		//number of additional fine samples per ray
-	exparams.net_depth_fine = 3;		//layers in fine network 8 for classic NeRF, 2/3 for HashNeRF
-	exparams.net_width_fine = 64;		//channels per layer in fine network 256 for classic NeRF, 64 for HashNeRF
-	exparams.num_layers_color = 2;				//for color part of the HashNeRF
+	exparams.num_layers_color = 3;				//for color part of the HashNeRF
 	exparams.hidden_dim_color = 64;			//for color part of the HashNeRF
-	exparams.num_layers_color_fine = 3;	//for color part of the HashNeRF
-	exparams.hidden_dim_color_fine = 64;	//for color part of the HashNeRF
 	exparams.num_layers_normals = 2;			//!!!->2
 	exparams.hidden_dim_normals = 64;
 	exparams.geo_feat_dim = 15;
-	exparams.n_levels = 18;
+	exparams.n_levels = 16;
 	exparams.n_features_per_level = 2;
-	exparams.log2_hashmap_size = 21;		//19
+	exparams.log2_hashmap_size = 19;		//19
 	exparams.base_resolution = 16;
 	exparams.finest_resolution = 1024;
 	exparams.device = torch::kCUDA;
@@ -214,6 +211,8 @@ int main(int argc, const char* argv[])
 	exparams.hidden_dim_le = 256;				//Language embedder head params
 	exparams.lang_embed_dim = 768;			//Language embedder head params
 	exparams.geo_feat_dim_le = 32;			//Language embedder head params
+	exparams.pyr_embed_min_zoom_out = 0;
+	exparams.pyr_embedder_overlap = 0.5f;
 	exparams.path_to_clip = "..//..//RuCLIP//data//ruclip-vit-large-patch14-336";									//Path to RuClip model
 	exparams.path_to_bpe = "..//..//RuCLIP//data//ruclip-vit-large-patch14-336//bpe.model";			//Path to tokenizer
 	exparams.lerf_positives = "металлическая тарелка";//"металлическая тарелка";//"красный барабан";
@@ -232,14 +231,13 @@ int main(int argc, const char* argv[])
 	params.NSamples = 64;						//number of coarse samples per ray
 	params.NRand = 32 * 32 * (exparams.use_lerf ? 1 : 16);		//batch size (number of random rays per gradient step), decrease if running out of memory >= Chunk, n*Chunk
 	params.PrecorpIters = 0;				//number of steps to train on central crops
-	params.NIters = 6100;
-	params.LRateDecay = 4;				//exponential learning rate decay (in 1000 steps)  например: 150 - каждые 150000 итераций скорость обучения будет падать в 10 раз
+	params.NIters = 8100;
+	params.LRateDecay = float(params.NIters) / 1000 * 2;				//exponential learning rate decay (in 1000 steps)  например: 150 - каждые 150000 итераций скорость обучения будет падать в 10 раз
 	//logging / saving options
 	params.IPrint = 100;						//frequency of console printout and metric loggin
 	params.IImg = 500;							//frequency of tensorboard image logging
-	params.IWeights = 6000;				//frequency of weight ckpt saving
-	params.ITestset = 6000;				//frequency of testset saving
-	params.IVideo = 6200;					//frequency of render_poses video saving
+	params.IWeights = 8000;				//frequency of weight ckpt saving
+	params.ITestset = 8000;				//frequency of testset saving
 	params.ReturnRaw = false;
 	params.RenderFactor = 0;
 	params.PrecorpFrac = 0.5f;
