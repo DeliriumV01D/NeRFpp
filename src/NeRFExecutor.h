@@ -1,11 +1,12 @@
 #pragma once
 
 #include "TorchHeader.h"
+#include <c10/cuda/CUDACachingAllocator.h>
 #include "load_blender.h"
 #include "Trainable.h"
 #include "CuSHEncoder.h"
 #include "CuHashEmbedder.h"
-#include "PyramidEmbedder.h"
+#include "PyramidEmbeddingDataloader.h"
 #include "NeRF.h"
 #include "LeRF.h"
 #include "LeRFRenderer.h"
@@ -21,8 +22,7 @@
 #include <filesystem>
 #include <chrono>
 #include <memory>
-
-//#include <torch/script.h>
+#include <functional>
 
 #include "json.hpp"
 
@@ -56,16 +56,21 @@ struct NeRFExecutorParams
 		n_features_per_level_le = n_features_per_level,								//for language embedder
 		log2_hashmap_size_le = log2_hashmap_size - 3,									//for language embedder
 		base_resolution_le = base_resolution,													//for language embedder
-		finest_resolution_le = finest_resolution / 4,										//for language embedder
+		finest_resolution_le = finest_resolution,										//for language embedder
 		clip_input_img_size{ 336 },	//Input RuClip model size
 		num_layers_le{ 3 },					//Language embedder head params
 		hidden_dim_le{ 64 },				//Language embedder head params
 		lang_embed_dim{ 768 },			//Language embedder head params
-		geo_feat_dim_le{ 32 },			//Language embedder head params
-		pyr_embed_min_zoom_out{ 0 };
+		geo_feat_dim_le{ 32 };			//Language embedder head params
 	torch::Device device{ torch::kCUDA };
 	float learning_rate{ 5e-4f },
-		pyr_embedder_overlap{0.75f};
+		pyr_embedder_overlap{0.75f},
+		lang_loss_weight{ 0.1f },		//LeRF percentile-cosine language loss weight (default 0.1)
+		distill_loss_weight{ 0.05f };		//sigma_le -> frozen-NeRF weights distillation loss weight
+		float pyr_tile_size_min{ 0.05f },	//Pyramid min tile ratio (fraction of image size) - LeRF default 0.05
+			pyr_tile_size_max{ 0.5f };		//Pyramid max tile ratio - LeRF default 0.5
+		int pyr_tile_size_res{ 7 };			//Number of linearly-spaced pyramid levels 7
+		float pyr_stride_scaler{ 0.5f };	//Stride-scaler value (max overlap at ratio>=0.15); 1.0 - no overlap, faster
 	std::filesystem::path ft_path,
 		path_to_clip,			//Path to RuClip model
 		path_to_bpe;			//Path to tokenizer
@@ -106,10 +111,15 @@ struct NeRFExecutorParams
 		j["hidden_dim_le"] = hidden_dim_le;
 		j["lang_embed_dim"] = lang_embed_dim;
 		j["geo_feat_dim_le"] = geo_feat_dim_le;
-		j["lang_embed_min_zoom_out"] = pyr_embed_min_zoom_out;
 		j["device"] = device.str();			//
 		j["learning_rate"] = learning_rate;
 		j["pyr_embedder_overlap"] = pyr_embedder_overlap;
+		j["lang_loss_weight"] = lang_loss_weight;
+		j["distill_loss_weight"] = distill_loss_weight;
+		j["pyr_tile_size_min"] = pyr_tile_size_min;
+		j["pyr_tile_size_max"] = pyr_tile_size_max;
+		j["pyr_tile_size_res"] = pyr_tile_size_res;
+		j["pyr_stride_scaler"] = pyr_stride_scaler;
 		j["ft_path"] = ft_path.string();
 		j["path_to_clip"] = path_to_clip.string();
 		j["path_to_bpe"] = path_to_bpe.string();
@@ -151,10 +161,15 @@ struct NeRFExecutorParams
 		j.at("hidden_dim_le").get_to(hidden_dim_le);
 		j.at("lang_embed_dim").get_to(lang_embed_dim);
 		j.at("geo_feat_dim_le").get_to(geo_feat_dim_le);
-		j.at("lang_embed_min_zoom_out").get_to(pyr_embed_min_zoom_out);
 		device = torch::Device(j.at("device").get<std::string>());					// Приводим device к правильному типу
 		learning_rate = j.at("learning_rate").get<float>();
 		pyr_embedder_overlap = j.at("pyr_embedder_overlap").get<float>();
+		lang_loss_weight = j.value("lang_loss_weight", lang_loss_weight);
+		distill_loss_weight = j.value("distill_loss_weight", distill_loss_weight);
+		pyr_tile_size_min = j.value("pyr_tile_size_min", pyr_tile_size_min);
+		pyr_tile_size_max = j.value("pyr_tile_size_max", pyr_tile_size_max);
+		pyr_tile_size_res = j.value("pyr_tile_size_res", pyr_tile_size_res);
+		pyr_stride_scaler = j.value("pyr_stride_scaler", pyr_stride_scaler);
 		ft_path = j.at("ft_path").get<std::string>();
 		path_to_clip = j.at("path_to_clip").get<std::string>();
 		path_to_bpe = j.at("path_to_bpe").get<std::string>();
@@ -309,7 +324,7 @@ protected:
 	std::unique_ptr<TNeRFRenderer> NeRFRenderer = nullptr;
 	std::unique_ptr<TLeRFRenderer> LeRFRenderer = nullptr;
 	std::vector<torch::Tensor> GradVars;
-	std::unique_ptr<torch::optim::Adam> Optimizer;
+	std::unique_ptr<torch::optim::AdamW> Optimizer;
 	int Start{0},
 		NImportance{0};
 	float LearningRate,
@@ -329,7 +344,8 @@ public:
 		int w,
 		int h,
 		const torch::Tensor k,
-		const NeRFRenderParams &rparams
+		const NeRFRenderParams &rparams,
+		const std::function<bool()> &is_aborted = {}			///Cancellation hook polled between render batches; return true to abort
 	);
 
 	///
@@ -406,11 +422,14 @@ NeRFRenderParams * NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TL
 	render_params->UseViewdirs = UseViewDirs;
 	render_params->ReturnWeights = returm_weights;
 	render_params->RenderFactor = executor_train_params.RenderFactor;
-
 	render_params->BoundingBox = BoundingBox;
-	render_params->RawNoiseStd = std::max(0.0f, 1.0f - static_cast<float>(iter) / (static_cast<float>(executor_train_params.NIters) / 8));  //Локальная регуляризация плотности помогает избежать артефактов типа "облаков" затухает за n_iters / 3 итераций
-	render_params->StochasticPreconditioningAlpha = StochasticPreconditioningAlpha0 * std::max(0.0f, 1.0f - static_cast<float>(iter) / (static_cast<float>(executor_train_params.NIters) / 6));  //добавляет шум к входу сети (координатам точек). Уменьшает чувствительность к инициализации. Помогает избежать "плавающих" артефактов
+	render_params->RawNoiseStd = std::max(0.0f, 1.0f - static_cast<float>(iter) / (static_cast<float>(executor_train_params.NIters) / 10));  //Локальная регуляризация плотности помогает избежать артефактов типа "облаков" затухает за n_iters / 3 итераций
+	render_params->StochasticPreconditioningAlpha = StochasticPreconditioningAlpha0 * std::max(0.0f, 1.0f - static_cast<float>(iter) / (static_cast<float>(executor_train_params.NIters) / 8));  //добавляет шум к входу сети (координатам точек). Уменьшает чувствительность к инициализации. Помогает избежать "плавающих" артефактов
 	
+	if (executor_params.use_lerf && executor_params.pyr_tile_size_min > 0.f && executor_params.pyr_tile_size_max > executor_params.pyr_tile_size_min && executor_params.pyr_tile_size_res > 0)
+		for (const float level : PyramidEmbeddingDataloader::GenerateScaleLevels(executor_params.pyr_tile_size_min, executor_params.pyr_tile_size_max, executor_params.pyr_tile_size_res))
+			render_params->LeRFSweepScalesNorm.push_back((level - executor_params.pyr_tile_size_min) / (executor_params.pyr_tile_size_max - executor_params.pyr_tile_size_min));
+
 	return render_params;
 }
 
@@ -536,7 +555,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 
 	//if constexpr (std::is_same_v<TNeRF, NeRF>)
 	//	Optimizer = std::make_unique<torch::optim::Adam>(GradVars, torch::optim::AdamOptions(params.learning_rate).eps(1e-7)/*.weight_decay(0.001)*/.betas(std::make_tuple(0.9, 0.999)));
-	Optimizer = std::make_unique<torch::optim::Adam>(GradVars, torch::optim::AdamOptions(params.learning_rate).eps(1e-15).betas(std::make_tuple(0.9, 0.99)));
+	Optimizer = std::make_unique<torch::optim::AdamW>(GradVars, torch::optim::AdamWOptions(params.learning_rate).eps(1e-8).weight_decay(0.01).betas(std::make_tuple(0.8, 0.99)));
 	
 	if (/*Проверить наличие файлов*/
 		std::filesystem::exists(params.ft_path / "start_checkpoint.pt") &&
@@ -583,6 +602,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 		std::cout << "Load clip from: " << params.path_to_clip << std::endl;
 		Clip = FromPretrained(params.path_to_clip);
 		Clip->to(params.device);
+		Clip->eval();
 		
 		std::cout << "Load processor from: " << params.path_to_bpe << std::endl;
 		ClipProcessor = std::make_shared<RuCLIPProcessor>(
@@ -611,7 +631,8 @@ std::tuple <NeRFRenderResult, LeRFRenderResult> NeRFExecutor<TEmbedder, TEmbedDi
 	int w,
 	int h,
 	const torch::Tensor k,
-	const NeRFRenderParams &rparams
+	const NeRFRenderParams &rparams,
+	const std::function<bool()> &is_aborted /*= {}*/			///Cancellation hook polled between render batches; return true to abort
 ){
 	torch::Tensor k1 = k.clone().detach();
 	if (rparams.RenderFactor != 0)
@@ -634,16 +655,19 @@ std::tuple <NeRFRenderResult, LeRFRenderResult> NeRFExecutor<TEmbedder, TEmbedDi
 			rparams,
 			/*Rays*/ {torch::Tensor(), torch::Tensor(), torch::Tensor()},
 			render_pose.to(Device).index({ torch::indexing::Slice(torch::indexing::None, 3), torch::indexing::Slice(torch::indexing::None, 4) }),
-			/*rparams.C2wStaticCam*/ torch::Tensor()
+			/*rparams.C2wStaticCam*/ torch::Tensor(),
+			is_aborted
 		);
 	}
-	if (Params.use_lerf)
+	//Skip the LeRF pass entirely when the NeRF pass was already cancelled
+	if (Params.use_lerf && !nerf_render_result.Aborted && (!is_aborted || !is_aborted()))
 	{
 		lerf_render_result = LeRFRenderer->Render(h, w, k1,
 			rparams,
 			/*Rays*/ {torch::Tensor(), torch::Tensor(), torch::Tensor()},
 			render_pose.to(Device).index({ torch::indexing::Slice(torch::indexing::None, 3), torch::indexing::Slice(torch::indexing::None, 4) }),
-			/*rparams.C2wStaticCam*/ torch::Tensor()
+			/*rparams.C2wStaticCam*/ torch::Tensor(),
+			is_aborted
 		);
 	}
 
@@ -666,6 +690,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 	//torch::Tensor gt_imgs = torch::Tensor(),
 	const std::filesystem::path savedir /*= ""*/
 ) {
+	torch::NoGradGuard no_grad;
 	//std::vector<torch::Tensor> rgbs,
 	//	disps;
 
@@ -679,6 +704,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 
 	for (size_t i = 0; i < render_poses.size(); i++)		//(auto &c2w : render_poses) //
 	{
+		torch::Tensor rgb_map;
 		if (Params.use_nerf)
 		{
 			auto render_result = std::move(NeRFRenderer->Render(h, w, k,
@@ -688,6 +714,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 				c2w_staticcam
 			));		
 			render_result.Outputs.DepthMap = (render_result.Outputs.DepthMap - render_result.Near) / (render_result.Far - render_result.Near);
+			rgb_map = render_result.Outputs.RGBMap;	//keep the RGB render for the LeRF relevancy composite below
 
 			//torch::Tensor normals_from_depth = NormalMapFromDepthMap(render_result.Outputs1.DepthMap.detach().cpu());
 			//if (!savedir.empty())
@@ -708,14 +735,10 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 				rays,
 				render_poses[i].index({ torch::indexing::Slice(torch::indexing::None, 3), torch::indexing::Slice(torch::indexing::None, 4) }), c2w_staticcam));
 
-			if (!savedir.empty())
+			if (!savedir.empty() && render_result.Outputs.RelevancyMap.defined())
 			{
-				torch::Tensor rel = render_result.Outputs.Relevancy.reshape({ h, w, 2 });
-				torch::Tensor pos_probs = rel.index({ "...", 0 });  // [H, W]
-				pos_probs = pos_probs.mul(255).to(torch::kU8).cpu();
-				cv::Mat relevancy_img(h, w, CV_8UC1, pos_probs.data_ptr());
-				cv::Mat colored_map;
-				cv::applyColorMap(relevancy_img, colored_map, cv::COLORMAP_JET);
+				//lerf-style threshold at 0.5 with the relevancy colormap, below it the RGB underlay, falls back to the full-range relevancy map when no RGB is available
+				cv::Mat colored_map = ComposeRelevancyOverRGB(render_result.Outputs.RelevancyMap.reshape({ h, w }), rgb_map);
 				cv::imwrite((savedir / ("relevancy_" + std::to_string(i) + ".png")).string(), colored_map);
 			}
 		}
@@ -744,12 +767,12 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 	for (auto &it : lerf_negatives)
 		canon_texts_tensors.push_back(ClipProcessor->EncodeText(it));
 	auto negatives = Clip->EncodeText(torch::stack(canon_texts_tensors).to(Device)).to(torch::kCPU); ///[3, 768]
-	//LerfNegatives = LerfNegatives / LerfNegatives.norm(2/*L2*/, -1, true);
+	negatives = negatives / negatives.norm(2/*L2*/, -1, true);
 	//output = torch::nn::functional::normalize(output, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8));
 
 	auto input = ClipProcessor->EncodeText(lerf_positives);
 	auto positives = Clip->EncodeText(input.unsqueeze(0).to(Device)).to(torch::kCPU);		///[1, 768]
-	//LerfPositives = LerfPositives / LerfPositives.norm(2/*L2*/, -1, true);
+	positives = positives / positives.norm(2/*L2*/, -1, true);
 	SetLeRFPrompts(positives, negatives);
 }
 
@@ -774,64 +797,48 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 {
 	try {
 		if (Params.use_lerf)
-		{
-
 			SetLeRFPrompts(Params.lerf_positives, Params.lerf_negatives);
-		}
 
 		if (Params.use_lerf && test)
 		{
 			std::cout << "lang embedding visualization test..." << std::endl;
-			//test
-			PyramidEmbedderProperties pyramid_embedder_properties;
-			pyramid_embedder_properties.ImgSize = { Params.clip_input_img_size, Params.clip_input_img_size };	//Входной размер изображения сети
-			pyramid_embedder_properties.Overlap = Params.pyr_embedder_overlap;										///Доля перекрытия
-			pyramid_embedder_properties.MinZoomOut = Params.pyr_embed_min_zoom_out;		//0 or -1
-			///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0 , 1, 2...
-			int wmax = 0,
-				hmax = 0;
-			for (auto &view : data.Views)
-			{
-				if (view.H > hmax)
-					hmax = view.H;
-				if (view.W > wmax)
-					wmax = view.W;
-			}
-			pyramid_embedder_properties.MaxZoomOut = std::min(log2f(wmax / Params.clip_input_img_size), log2f(hmax / Params.clip_input_img_size));
-			//auto scale = Clip->GetLogitScale().exp().to(torch::kCPU);
-
 			int img_id = 0;
 
-			//!!!В этом месте можно распараллелить через выполнение батчами на GPU
-			//!Объединив несколько cat({image_features1..image_featuresТ})
 			cv::Mat test_img(data.Views[img_id].H, data.Views[img_id].W, CV_8UC1);
 			auto [lerf_positives, lerf_negatives] = LeRFRenderer->GetLeRFPrompts();
-			#pragma omp parallel for
-			for (int i = 0; i < data.Views[img_id].W; i++)
-				for (int j = 0; j < data.Views[img_id].H; j++)
-				{
-					torch::Tensor image_features = dataset.GetPyramidClipEmbedding()->GetPixelValue(i, j, 0.5f, img_id, pyramid_embedder_properties, cv::Size(data.Views[img_id].W, data.Views[img_id].H)).to(torch::kCPU);
-					//Уже нормировано при вычислении пирамиды normalize features???
-					//image_features = image_features / image_features.norm(2/*L2*/, -1, true);
-					//output = torch::nn::functional::normalize(output, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8));
 
-					////cosine similarity as logits
-					//auto logits = /*scale * */torch::mm(image_features, LerfPositives.t());
-					//float lv = (logits[0,0].item<float>()/*/scale*/ + 1)/2;
-					//test_img.at<uchar>(j, i) = cv::saturate_cast<uchar>(/*(lv>0.5?lv:0)*/lv * 125);	//[-1..1] -> [0..255]
+			//Chunked query
+			const int64_t H = data.Views[img_id].H, W = data.Views[img_id].W;
+			auto rows = torch::arange(H, torch::kFloat32).unsqueeze(1).expand({ H, W }).reshape({ -1 });
+			auto cols = torch::arange(W, torch::kFloat32).unsqueeze(0).expand({ H, W }).reshape({ -1 });
+			auto img_ids = torch::zeros({ H * W }, torch::kLong);
+			auto all_points = torch::stack({ img_ids, rows, cols }, 1);	//(H*W, 3) = [img_id, row, col]; the pyramid moves it to Device itself
 
-					//relevancy
-					torch::Tensor rel = Relevancy(image_features, lerf_positives, lerf_negatives);
-					float lv = rel.index({ 0,0 }).item<float>();
-					test_img.at<uchar>(j, i) = cv::saturate_cast<uchar>(lv * 255);	//[-1..1] -> [0..255]
-				}
+			torch::NoGradGuard no_grad;
+			const int64_t chunk = 65536;		//chunk instead of H*W*768*4
+			const auto scale = torch::scalar_tensor(0.5f, torch::kFloat32);
+			auto pos_d = lerf_positives.to(Device),
+				neg_d = lerf_negatives.to(Device);
+			auto rel_col = torch::empty({ H * W }, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+			for (int64_t off = 0; off < H * W; off += chunk)
+			{
+				const int64_t b = (H * W - off < chunk) ? H * W - off : chunk;
+				auto pts = all_points.narrow(0, off, b);
+				auto embeds = std::get<0>(dataset.GetPyramidClipEmbedding()->operator()(pts, scale));		//(b, 768) on Device
+				auto rel = Relevancy(embeds.to(torch::kFloat32).to(Device), pos_d, neg_d);		//(b, 2) on Device; column 0 = positive-prompt probability
+				rel_col.narrow(0, off, b).copy_(rel.select(1, 0));		//copy the positive column into the CPU accumulator
+			}
+			cv::Mat flat(static_cast<int>(H * W), 1, CV_32FC1, rel_col.data_ptr<float>());
+			cv::Mat scaled;
+			flat.convertTo(scaled, CV_8UC1, 255.0);	//[0..1] -> [0..255], convertTo saturates like cv::saturate_cast
+			test_img = scaled.reshape(0, static_cast<int>(H));
 			cv::imshow("img", cv::imread(data.Views[img_id].ImagePath.string(), cv::IMREAD_UNCHANGED));
 			cv::Mat colored_map;
 			cv::applyColorMap(test_img, colored_map, cv::COLORMAP_JET);
 			cv::imshow("test_img", colored_map);
 			cv::waitKey(1);
 		}
-	} catch (std::exception& e) {
+	} catch (std::exception &e) {
 		std::cout << e.what() << std::endl;
 	}
 }
@@ -847,13 +854,19 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 	lerf_data_params.UseLerf = Params.use_lerf;
 	lerf_data_params.clip_input_img_size = Params.clip_input_img_size;
 	lerf_data_params.lang_embed_dim = Params.lang_embed_dim;
-	lerf_data_params.MinZoomOut = Params.pyr_embed_min_zoom_out;
+	lerf_data_params.pyr_tile_size_min = Params.pyr_tile_size_min;
+	lerf_data_params.pyr_tile_size_max = Params.pyr_tile_size_max;
+	lerf_data_params.pyr_tile_size_res = Params.pyr_tile_size_res;
+	lerf_data_params.pyr_stride_scaler = Params.pyr_stride_scaler;
 	lerf_data_params.pyr_embedder_overlap = Params.pyr_embedder_overlap;
 	lerf_data_params.PyramidClipEmbeddingSaveDir = params.PyramidClipEmbeddingSaveDir;	
 	NeRFDataset dataset(data, lerf_data_params, params.NRand, params.PrecorpIters, params.PrecorpFrac, Device, Clip, ClipProcessor);
 
 	if (Params.use_lerf)
 		InitializeTestLeRF(params, data, dataset, true);
+
+	//Release init-phase VRAM instead of keeping them reserved until the end of the whole training run
+	c10::cuda::CUDACachingAllocator::emptyCache();
 
 	int global_step = Start;
 	for (int i = this->Start + 1; i < params.NIters; i++)
@@ -869,7 +882,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 		
 		torch::Tensor loss = torch::full({ 1/*img_loss.sizes()*/ }, 0.f).to(Device),
 			psnr = torch::full({ 1/*img_loss.sizes()*/ }, 10.f).to(Device);
-
+		torch::Tensor nerf_weights;		//Frozen-NeRF weights snapshot: reference for the LeRF percentile selection and sigma_le distillation (no LeRF->NeRF backprop)
 		if (Params.use_nerf)
 		{
 			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, i, data.BoundingBox, true, Params.calculate_normals || Params.use_pred_normal));
@@ -881,8 +894,8 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 		
 			mse_loss = torch::mse_loss(rgb_disp_acc_extras.Outputs.RGBMap, batch.target.target_s.detach());
 			img_loss = torch::nn::functional::huber_loss(
-						rgb_disp_acc_extras.Outputs.RGBMap,
-						batch.target.target_s.detach()
+					rgb_disp_acc_extras.Outputs.RGBMap,
+					batch.target.target_s.detach()
 				);
 			if (params.ReturnRaw)
 				auto trans = rgb_disp_acc_extras.Raw.index({ "...", -1 });		//последний элемент последнего измерения тензора
@@ -911,6 +924,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 						).to(loss.device());
 					}
 				}
+			
 
 			////add Total Variation loss
 			//if constexpr (std::is_same_v<TEmbedder, CuHashEmbedder>)
@@ -920,6 +934,10 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 			//		loss += tv_loss_weight * TotalVariationLoss(ExecutorEmbedder).to(loss.device());
 			//	}
 
+			//Frozen-NeRF weights snapshot: reference for the LeRF percentile selection and
+			//sigma_le distillation (detach: no LeRF->NeRF backprop)
+			if (rgb_disp_acc_extras.Outputs.Weights.defined() && rgb_disp_acc_extras.Outputs.Weights.numel() != 0)
+				nerf_weights = rgb_disp_acc_extras.Outputs.Weights.detach();
 			loss.backward();
 		}		//if use_nerf
 
@@ -953,10 +971,15 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 		}		//if use_nerfactor
 
 		torch::Tensor lang_loss;
-		const float lang_loss_weight = 1e-1f;//1e-2f;
+		const float lang_loss_weight = Params.lang_loss_weight,
+			distill_loss_weight = Params.distill_loss_weight;
 		if (Params.use_lerf)
 		{
 			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, i, data.BoundingBox, true, Params.calculate_normals || Params.use_pred_normal));
+			//Per-ray pyramid scale + view geometry for the field's scale conditioning
+			render_params->LeRFScales = batch.target.target_lerf_scale;
+			render_params->LeRFImageHeight = batch.target.target_image_height;
+			render_params->LeRFFocalY = batch.target.target_focal_y;
 			auto lerf_render_result = std::move(LeRFRenderer->Render(0, 0, torch::Tensor(),/*либо rays либо data.H, data.W, data.K,*/
 				*render_params, { batch.data.rays_o, batch.data.rays_d, batch.data.cone_angle }, torch::Tensor(), torch::Tensor()				/*либо rays либо pose c2w*/
 			));
@@ -966,20 +989,62 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 			//	target_lang_embedding.detach().to(loss.device()),//target clip embeddings provided by PyramidEmbedder for a given set of pixels
 			//	torch::ones({rgb_disp_acc_extras.Outputs1.RenderedLangEmbedding.sizes()[0]})
 			//);
-			lang_loss = torch::nn::functional::huber_loss(
-					lerf_render_result.Outputs.RenderedLangEmbedding.to(loss.device()),
-					batch.target.target_lang_embedding.detach().to(loss.device()),	//target clip embeddings provided by PyramidEmbedder for a given set of pixels
-					torch::nn::functional::HuberLossFuncOptions().reduction(torch::kNone).delta(1.25)
-				).sum(-1).nanmean();
+			{
+				//Percentile point selection (paper formulation): x_max = argmax weight, one random point from the lowest [0,5]% weights and one from the top [95,100]%.
+				//Weights come from the frozen NeRF pass (same rays); fallback = LeRF's own WeightsLE
+				torch::Tensor w = (nerf_weights.defined() && nerf_weights.numel() != 0) ? nerf_weights : lerf_render_result.Outputs.WeightsLE.detach();
+				const int64_t N = w.size(-1);
+				auto [sorted_w, sorted_idx] = torch::sort(w, -1);
+				//row index of the 5% / 95% percentile in the per-ray sorted weights
+				int64_t lo_i = static_cast<int64_t>(0.05f * static_cast<float>(N - 1));
+				int64_t hi_i = static_cast<int64_t>(0.95f * static_cast<float>(N - 1));
+				auto p_lo = sorted_w.index({ torch::indexing::Slice(), lo_i }).unsqueeze(-1);
+				auto p_hi = sorted_w.index({ torch::indexing::Slice(), hi_i }).unsqueeze(-1);
+				//random pick among the candidates: mask * rand, then argmax
+				auto lo_pick = (w <= p_lo).to(torch::kFloat32).mul(torch::rand_like(w)).argmax(-1);
+				auto hi_pick = (w >= p_hi).to(torch::kFloat32).mul(torch::rand_like(w)).argmax(-1);
+				auto max_pick = w.argmax(-1);
+				auto picks = torch::stack({ max_pick, lo_pick, hi_pick }, -1);		//[B, 3]
+
+				//Gather the field outputs at the selected points: the render pass already evaluated the scale-conditioned field there, so no re-query of the network is needed
+				const int64_t D = lerf_render_result.Outputs.LangEmbedding.size(-1);
+				auto emb_sel = lerf_render_result.Outputs.LangEmbedding.gather(1, picks.unsqueeze(-1).expand({ picks.size(0), 3, D }));		//[B, 3, D]
+				auto gt = batch.target.target_lang_embedding.detach().to(loss.device()).unsqueeze(1).expand({ picks.size(0), 3, D });
+				//1 - cosine similarity between the field outputs and the pyramid GT at the 3 points, equal to
+				//auto dot = torch::sum(emb_sel * gt, -1);		//[B, 3]
+				//auto denom = (emb_sel.norm(2, -1, true) * gt.norm(2, -1, true)).squeeze(-1).clamp_min(1e-8f);
+				//lang_loss = (1.f - dot / denom).nanmean();
+				auto cos = torch::nn::functional::cosine_similarity(emb_sel, gt,torch::nn::functional::CosineSimilarityFuncOptions().dim(-1).eps(1e-8));
+				lang_loss = (1.f - cos).nanmean();
+			}
+
+			//sigma_le distillation: the percentile loss gives no gradient to sigma_le (point selection is non-differentiable),
+			//but inference composites relevancy with WeightsLE -> align them with the frozen NeRF weights so the composite becomes meaningful
+			torch::Tensor distill_loss;
+			{
+				auto w_le = lerf_render_result.Outputs.WeightsLE;
+				if (w_le.defined() && w_le.numel() != 0 && nerf_weights.defined() && nerf_weights.numel() != 0 && w_le.sizes() == nerf_weights.sizes())
+				{
+					auto w_le_n = w_le / w_le.sum(-1).unsqueeze(-1).clamp_min(1e-6f);
+					auto w_nerf_n = nerf_weights / torch::sum(nerf_weights, -1).unsqueeze(-1).clamp_min(1e-6f);
+					distill_loss = (w_le_n - w_nerf_n).pow(2).sum(-1).nanmean();
+				}
+			}
 			//lang_loss = torch::nn::functional::huber_loss(
 			//	rgb_disp_acc_extras.Outputs1.RenderedLangEmbedding.to(loss.device()),
 			//	target_lang_embedding.detach().to(loss.device())	//target clip embeddings provided by PyramidEmbedder for a given set of pixels
 			//);
 			//lang_loss = - torch::mm(rgb_disp_acc_extras.Outputs1.RenderedLangEmbedding.to(loss.device()), target_lang_embedding.detach().to(loss.device()).t()).nanmean();
 			//auto lang_loss = torch::mse_loss(rgb_disp_acc_extras.Outputs1.RenderedLangEmbedding.to(loss.device()), target_lang_embedding.to(loss.device()));
-			//loss = loss + lang_loss * lang_loss_weight;
-			std::cout<<"lang_loss: " << lang_loss << std::endl;
-			lang_loss.backward();
+			//Accumulate into the total loss for logging; gradients flow through the separate
+			//backward below (backward() calls accumulate into .grad, so the NeRF part above stays intact)
+			torch::Tensor lang_total = lang_loss * lang_loss_weight;
+			if (distill_loss.defined() && distill_loss.numel() != 0)
+				lang_total = lang_total + distill_loss_weight * distill_loss;
+			loss = loss + lang_total;
+			if (i % params.IPrint == 0)
+				std::cout << "lang_loss: " << lang_loss.item<float>() << "; distill_loss: " << (distill_loss.defined() && distill_loss.numel() != 0 ? distill_loss.item<float>() : 0.f) << std::endl;
+			lang_total.backward();
 		}		//if use_lerf
 
 		try {
@@ -1046,6 +1111,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 
 		global_step++;
 	}	//for (int i = this->Start + 1; i < params.NIters; i++)
+	c10::cuda::CUDACachingAllocator::emptyCache();
 }			//NeRFExecutor :: Train
 
 

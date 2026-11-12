@@ -1,17 +1,22 @@
 #include "LeRFRenderer.h"
 #include "RuCLIPProcessor.h"	//Relevancy
+#include <ATen/cuda/CUDAContext.h>
 
 ///Prepares inputs and applies network lerf or lerf_fine.
-torch::Tensor LeRFRenderer :: RunLENetwork(torch::Tensor inputs, LeRF lerf, CuHashEmbedder lang_embed_fn)
+torch::Tensor LeRFRenderer :: RunLENetwork(torch::Tensor inputs, LeRF lerf, CuHashEmbedder lang_embed_fn, torch::Tensor lerf_point_scales)
 {
 	//return NeRFRenderer :: RunNetwork(inputs,	torch::Tensor(), lerf, lang_embed_fn, nullptr);
 
 	//можно попробовать научить работать эмбедер с батчами чтобы не плющить тензоры?
 	torch::Tensor inputs_flat = inputs.view({ -1, inputs.sizes().back()/*[-1]*/ });  //[1024, 256, 3] -> [262144, 3]
-	inputs_flat.set_requires_grad(false);
-	auto [embedded, keep_mask] = lang_embed_fn->forward(inputs_flat); 
 
-	torch::Tensor outputs_flat = lerf->forward(embedded);
+	auto [embedded, keep_mask] = lang_embed_fn->forward(inputs_flat);
+	//Per-point scale conditioning: flatten (B, N, 1) -> (B*N, 1) aligned with the embedded rows; empty = default 1.0 in the field
+	torch::Tensor scales_flat = torch::Tensor();
+	if (lerf_point_scales.defined() && lerf_point_scales.numel() != 0)
+		scales_flat = lerf_point_scales.reshape({ -1, 1 }).to(embedded.device(), embedded.scalar_type());
+
+	torch::Tensor outputs_flat = lerf->forward(embedded, scales_flat);
 
 	//set sigma to 0 for invalid points
 	if (keep_mask.defined() && keep_mask.numel() != 0)
@@ -34,10 +39,11 @@ LeRFRendererOutputs LeRFRenderer :: RawToLEOutputs(
 	torch::Device device = raw_le.device();
 	LeRFRendererOutputs result;
 
-	auto raw2alpha = [](torch::Tensor raw, torch::Tensor dists) {return -torch::autograd::TruncExp::apply(-torch::relu(raw) * dists)[0] + 1.f;};
+	auto raw2alpha = [](torch::Tensor raw, torch::Tensor dists) {return 1.f - torch::exp(- torch::clamp(torch::relu(raw) * dists.contiguous(), 0.0f, 38.0f));};
 
 	auto dists_le = z_vals_le.index({ "...", torch::indexing::Slice(1, torch::indexing::None) }) - z_vals_le.index({ "...", torch::indexing::Slice(torch::indexing::None, -1) });
-	dists_le = torch::cat({ dists_le, (torch::ones(1, torch::kFloat32) * 1e10).expand(dists_le.index({ "...", torch::indexing::Slice(torch::indexing::None, 1) }).sizes()).to(device)}, -1);  // [N_rays, N_samples]
+	//dists_le = torch::cat({ dists_le, dists_le.index({ "...", torch::indexing::Slice(-1, torch::indexing::None) }) }, -1);
+	dists_le = torch::cat({ dists_le, (torch::ones(1, torch::kFloat32) * 1e8).expand(dists_le.index({ "...", torch::indexing::Slice(torch::indexing::None, 1) }).sizes()).to(device)}, -1);  // [N_rays, N_samples]
 	dists_le = dists_le * torch::norm(rays_d.index({ "...", torch::indexing::None, torch::indexing::Slice() }), 2/*L2*/, /*dim*/-1);
 	if (!dists_le.requires_grad())
 		dists_le.set_requires_grad(true);
@@ -51,24 +57,21 @@ LeRFRendererOutputs LeRFRenderer :: RawToLEOutputs(
 		le_density_before_activation = le_density_before_activation + torch::randn_like(le_density_before_activation) * raw_noise_std;
 
 	torch::Tensor le_alpha = raw2alpha(le_density_before_activation, dists_le);  //[N_rays, N_samples]
-	
-	//result.WeightsLE = le_alpha * torch::cumprod(
-	//		torch::cat({ torch::ones({le_alpha.sizes()[0], 1}).to(device), -le_alpha + 1.f + 1e-10f }, -1),
-	//		-1
-	//	).index({ torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, -1) });
-	auto compute_weights_in_log_space = [](torch::Tensor alpha, torch::Device device)
-	{
-		//Вычисляем log(1 - alpha) с защитой от log(0)
-		auto log_transmittance = torch::cat({
-				torch::zeros({alpha.size(0)/*nrays*/, 1}, torch::TensorOptions().device(device)),
-				torch::cumsum(torch::log(torch::clamp_min(1.0f - alpha, 1e-10f)), -1)
-			}, -1).index({ torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, -1) });
-		auto weights = alpha * torch::autograd::TruncExp::apply(log_transmittance)[0];
-		return weights;
-	};
-	result.WeightsLE = compute_weights_in_log_space(le_alpha, device);
+
+	//auto compute_weights_in_log_space = [](torch::Tensor alpha, torch::Device device)
+	//{
+	//	//Вычисляем log(1 - alpha) с защитой от log(0)
+	//	auto log_transmittance = torch::cumsum(torch::log(torch::clamp(1.0f - alpha, 1e-8f, 1.f)), -1);
+	//	auto weights = alpha * torch::exp(log_transmittance);
+	//	return weights;
+	//};
+	//result.WeightsLE = compute_weights_in_log_space(le_alpha, device);
+	result.WeightsLE = le_alpha * torch::cumprod(
+			torch::cat({ torch::ones({le_alpha.sizes()[0], 1}).to(device), torch::clamp(1.f - le_alpha , 1e-8f, 1.f) }, -1),
+			-1
+		).index({ torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, -1) });
 	result.DepthMapLE = torch::sum(result.WeightsLE * z_vals_le, -1) / torch::clamp_min(torch::sum(result.WeightsLE, -1), 1e-10f);
-	result.DispMapLE = 1. / torch::max(1e-10 * torch::ones_like(result.DepthMapLE), result.DepthMapLE);
+	result.DispMapLE = 1. / torch::max(1e-10f * torch::ones_like(result.DepthMapLE), result.DepthMapLE);
 	result.AccMapLE = torch::sum(result.WeightsLE, -1);
 	cur_pos += 1;
 
@@ -76,7 +79,7 @@ LeRFRendererOutputs LeRFRenderer :: RawToLEOutputs(
 	//result.RenderedLangEmbedding = RenderCLIPEmbedding(result.LangEmbedding, result.Weights.unsqueeze(-1).detach());
 	//result.RenderedLanguageEmbedding = CLIPEmbeddingShader(result.RenderedLanguageEmbedding);
 
-	result.Relevancy = Relevancy(result.RenderedLangEmbedding, LerfPositives.to(device), LerfNegatives.to(device));
+	//Relevancy is no longer stored here: RenderRays derives the single RelevancyMap at the pass scale or via the inference sweep
 
 	return result;
 }
@@ -95,8 +98,12 @@ LeRFRenderResult LeRFRenderer :: RenderRays(
 	const float stochastic_preconditioning_alpha /*= 0.f*/,///добавляет шум к входу сети (координатам точек). Уменьшает чувствительность к инициализации. Помогает избежать "плавающих" артефактов
 	torch::Tensor bounding_box /*= torch::Tensor()*/,
 	//const int lang_embed_dim /*= 768*/,
-	const bool return_weights /*= true*/
-){
+	const bool return_weights /*= true*/,
+	torch::Tensor lerf_scales /*= torch::Tensor()*/,					///Per-ray normalized pyramid scale (B,1); empty = eval default
+	const float lerf_image_height /*= 0.f*/,					///View height in pixels for world-scale conversion
+	const float lerf_focal_y /*= 0.f*/,						///View focal length fy in pixels
+	const std::vector<float> &lerf_sweep_scales_norm /*= {}*/					///Actual pyramid levels the field was trained on; empty = legacy hardcoded list
+	) {
 	LeRFRenderResult lerf_result;
 	torch::Device device = ray_batch.device();		//Передать параметром??
 
@@ -110,6 +117,16 @@ LeRFRenderResult LeRFRenderer :: RenderRays(
 	auto ray_bounds = torch::reshape(ray_batch.index({ "...", torch::indexing::Slice(6, 8) }), { -1, 1, 2 });
 	auto near = ray_bounds.index({ "...", 0 });
 	auto far = ray_bounds.index({ "...", 1 }); //[-1, 1
+
+	//Per-point world-scale conversion: s_world = s_norm * H * dist / fy.  dist is the Euclidean
+	auto compute_point_scales = [&](const torch::Tensor &sample_pts) -> torch::Tensor {
+		if (!lerf_scales.defined() || lerf_scales.numel() == 0 || lerf_image_height <= 0.f || lerf_focal_y <= 0.f)
+			return torch::Tensor();
+		//s_norm must broadcast against the 3-D dist [B, N, 1]: a 2-D [B, 1] 
+		auto s_norm = lerf_scales.to(ray_batch.device()).to(torch::kFloat32).reshape({ -1, 1, 1 });
+		auto dist = torch::norm(sample_pts - rays_o.index({ torch::indexing::Slice(), torch::indexing::None, torch::indexing::Slice() }), 2/*L2*/, /*dim=*/-1, /*keepdim=*/true);	//[B, N, 1]
+		return s_norm * lerf_image_height * dist / lerf_focal_y;
+	};
 
 	torch::Tensor t_vals = torch::linspace(0.f, 1.f, n_samples, torch::kFloat).to(device);
 	torch::Tensor z_vals;
@@ -139,9 +156,9 @@ LeRFRenderResult LeRFRenderer :: RenderRays(
 	}
 
 	auto pts = rays_o.index({ "...", torch::indexing::None, torch::indexing::Slice() }) + rays_d.index({ "...", torch::indexing::None, torch::indexing::Slice() }) * z_vals.index({ "...", torch::indexing::Slice(), torch::indexing::None}); //[N_rays, N_samples, 3]
-	pts = TangentScatter(pts, z_vals, cone_angle, rays_d, device, bounding_box);
+	pts = TangentScatter(pts, z_vals, near, cone_angle, rays_d, device, bounding_box);
 
-	torch::Tensor raw =  RunLENetwork(pts, Lerf, LangEmbedFn);
+	torch::Tensor raw =  RunLENetwork(pts, Lerf, LangEmbedFn, compute_point_scales(pts));
 	auto outputs1 = RawToLEOutputs(raw, z_vals, rays_d, Lerf->GetLangEmbedDim(), raw_noise_std);
 
 	if (n_importance > 0)
@@ -152,7 +169,8 @@ LeRFRenderResult LeRFRenderer :: RenderRays(
 		torch::Tensor z_indices;
 		std::tie(z_vals, z_indices) = torch::sort(torch::cat({ z_vals, z_samples }, -1), -1);
 		pts = rays_o.index({ "...", torch::indexing::None, torch::indexing::Slice() }) + rays_d.index({ "...", torch::indexing::None, torch::indexing::Slice() }) * z_vals.index({ "...", torch::indexing::Slice(), torch::indexing::None }); // [N_rays, N_samples + N_importance, 3]
-		
+		pts = TangentScatter(pts, z_vals, near, cone_angle, rays_d, device, bounding_box);
+
 		//Применяем стохастическое предобуславливание
 		if (stochastic_preconditioning_alpha > 0.0f)
 		{
@@ -164,12 +182,53 @@ LeRFRenderResult LeRFRenderer :: RenderRays(
 			pts = ReflectBoundary(pts, min_bound, max_bound);	//Обрабатываем границы отражением
 		}
 
-		pts = TangentScatter(pts, z_vals, cone_angle, rays_d, device, bounding_box);
-
-		raw = RunLENetwork(pts, Lerf, LangEmbedFn);
+		raw = RunLENetwork(pts, Lerf, LangEmbedFn, compute_point_scales(pts));
 		lerf_result.Outputs = RawToLEOutputs(raw, z_vals, rays_d, Lerf->GetLangEmbedDim(), raw_noise_std);
 		//result.ZStd = torch::std(z_samples, -1, false);  // [N_rays]
-	}		//if (n_importance > 0)
+	}	else
+		lerf_result.Outputs = outputs1;
+
+	//Final relevancy. With per-ray pyramid scales (training-style passes) it is taken at the pass scale;
+	//the inference sweep below overwrites it with the max over scales when no per-ray scales are supplied.
+	if ((lerf_scales.defined() && lerf_scales.numel() != 0) && LerfPositives.defined() && LerfPositives.numel() != 0 && LerfNegatives.defined() && LerfNegatives.numel() != 0)
+	{
+		torch::NoGradGuard no_grad;
+		auto rel = Relevancy(lerf_result.Outputs.RenderedLangEmbedding, LerfPositives.to(device), LerfNegatives.to(device));
+		lerf_result.Outputs.RelevancyMap = rel.index({ torch::indexing::Slice(), 0 }).unsqueeze(-1);	//[B, 1]
+	}
+
+	//Inference scale sweep (get_max_across): composite relevancy is evaluated at several observation scales and the per-ray max is kept. Training passes carry
+	//per-ray pyramid scales and skip this block; sweep scales are pyramid-normalized and converted to world units exactly like training: s = s_norm * H * dist / fy.
+	if ((!lerf_scales.defined() || lerf_scales.numel() == 0)
+		&& lerf_image_height > 0.f && lerf_focal_y > 0.f
+		&& LerfPositives.defined() && LerfPositives.numel() != 0
+		&& LerfNegatives.defined() && LerfNegatives.numel() != 0)
+	{
+		//Max over scales is non-differentiable and inference-only: never build a graph here
+		//(also protects RenderPath test renders issued from inside the training loop)
+		torch::NoGradGuard no_grad;
+		auto positives_d = LerfPositives.to(device),
+			 negatives_d = LerfNegatives.to(device);
+		//Sequential sweep: one network pass per scale with a running max over the positive probability (Relevancy column 0).
+		//dist is the Euclidean distance to the actual sample positions (after TangentScatter offsets),
+		auto dist = torch::norm(pts - rays_o.index({ torch::indexing::Slice(), torch::indexing::None, torch::indexing::Slice() }), 2/*L2*/, /*dim=*/-1, /*keepdim=*/true);	//[B, N, 1]
+		const float world_scale = lerf_image_height / lerf_focal_y;
+		const std::vector<float> legacy_sweep_scales_norm = { 1.0f, 1.0f / 3.0f, 1.0f / 9.0f, 0.0f };
+		const std::vector<float> &sweep_scales = lerf_sweep_scales_norm.empty() ? legacy_sweep_scales_norm : lerf_sweep_scales_norm;
+		torch::Tensor pos_prob_max;	//[B] running max over the scales
+		for (const float s_norm : sweep_scales)
+		{
+			//Per-point scale conditioning in world units: s = s_norm * H * dist / fy (same as training)
+			auto point_scales = (s_norm * world_scale) * dist;	//[B, N, 1] (dist is already [B, N, 1])
+			auto raw_s = RunLENetwork(pts, Lerf, LangEmbedFn, point_scales);
+			auto outs_s = RawToLEOutputs(raw_s, z_vals, rays_d, Lerf->GetLangEmbedDim(), 0.f);
+			//Positive probability vs the hardest negative (column 0)
+			auto rel_s = Relevancy(outs_s.RenderedLangEmbedding, positives_d, negatives_d);
+			auto pos_prob = rel_s.index({ torch::indexing::Slice(), 0 });	//[B]
+			pos_prob_max = pos_prob_max.defined() ? torch::maximum(pos_prob_max, pos_prob) : pos_prob;
+		}
+		lerf_result.Outputs.RelevancyMap = pos_prob_max.unsqueeze(-1);	//[B, 1]
+	}
 
 	if (return_raw)
 		lerf_result.Raw = raw;
@@ -199,13 +258,24 @@ LeRFRenderResult LeRFRenderer :: BatchifyRays(
 	const float raw_noise_std /*= 0.*/,
 	const float stochastic_preconditioning_alpha /*= 0.f*/,
 	torch::Tensor bounding_box /* = torch::Tensor()*/,
-	const bool return_weights /*= true*/
+	const bool return_weights /*= true*/,
+	torch::Tensor lerf_scales /*= torch::Tensor()*/,					///Per-ray normalized pyramid scale (B,1); empty = eval default
+	const float lerf_image_height /*= 0.f*/,					///View height in pixels for world-scale conversion
+	const float lerf_focal_y /*= 0.f*/,						///View focal length fy in pixels
+	const std::function<bool()> &is_aborted /*= {}*/,			///Cancellation hook polled between batches; return true to abort
+	const std::vector<float> &lerf_sweep_scales_norm /*= {}*/					///Actual pyramid levels the field was trained on; empty = legacy hardcoded list
 ) {
 	LeRFRenderResult result;
 	std::vector<LeRFRenderResult> all_results;
 	all_results.reserve(rays_flat.sizes()[0] / chunk);
 	for (int i = 0; i < rays_flat.sizes()[0]; i += chunk)
 	{
+		//Cooperative cancellation point: an abort is noticed within at most one chunk of GPU work
+		if (is_aborted && is_aborted())
+		{
+			result.Aborted = true;
+			break;
+		}
 		all_results.emplace_back(RenderRays(
 			rays_flat.index({ torch::indexing::Slice(i, ((i + chunk) <= rays_flat.sizes()[0])?(i+chunk):(rays_flat.sizes()[0])) }),
 			cone_angle,/*пока скаляр, потом .index({ torch::indexing::Slice(i, ((i + chunk) <= cone_angle.sizes()[0]) ? (i + chunk) : (cone_angle.sizes()[0])) }),*/
@@ -218,8 +288,20 @@ LeRFRenderResult LeRFRenderer :: BatchifyRays(
 			raw_noise_std,
 			stochastic_preconditioning_alpha,
 			bounding_box,
-			return_weights
+			return_weights,
+			(lerf_scales.defined() && lerf_scales.numel() != 0)
+				? lerf_scales.index({ torch::indexing::Slice(i, ((i + chunk) <= lerf_scales.sizes()[0]) ? (i + chunk) : lerf_scales.sizes()[0]) })
+				: torch::Tensor(),
+			lerf_image_height,
+			lerf_focal_y,
+			lerf_sweep_scales_norm
 		));
+		//Pacing (interactive only): wait until the GPU has actually executed this chunk.
+		//Without it the host enqueues the whole level in microseconds and blocks in the
+		//end-of-level item<float>() sync, so the cancellation check above would only fire
+		//between fully executed levels, making the whole level the indivisible unit of work.
+		if (is_aborted && rays_flat.is_cuda())
+			at::cuda::getCurrentCUDAStream().synchronize();
 	}
 	//Слить all_results в один RenderResult используя torch::cat(torch::TensorList - at::ArrayRef ...
 	//!!!make this part cleaner and shorter
@@ -229,14 +311,14 @@ LeRFRenderResult LeRFRenderer :: BatchifyRays(
 		out_depth_map_le,
 		out_lang_embedding,
 		out_rendered_lang_embedding,
-		out_relevancy,
+		out_relevancy_map,
 		out0_disp_map_le,
 		out0_acc_map_le,
 		out0_weights_le,
 		out0_depth_map_le,
 		out0_lang_embedding,
 		out0_rendered_lang_embedding,
-		out0_relevancy,
+		out0_relevancy_map,
 		raw;
 	for (auto it : all_results)
 	{
@@ -246,7 +328,7 @@ LeRFRenderResult LeRFRenderer :: BatchifyRays(
 		if (it.Outputs.DepthMapLE.defined()) out_depth_map_le.push_back(it.Outputs.DepthMapLE);
 		if (it.Outputs.LangEmbedding.defined()) out_lang_embedding.push_back(it.Outputs.LangEmbedding);
 		if (it.Outputs.RenderedLangEmbedding.defined()) out_rendered_lang_embedding.push_back(it.Outputs.RenderedLangEmbedding);
-		if (it.Outputs.Relevancy.defined()) out_relevancy.push_back(it.Outputs.Relevancy);
+		if (it.Outputs.RelevancyMap.defined()) out_relevancy_map.push_back(it.Outputs.RelevancyMap);
 		if (it.Raw.defined()) raw.push_back(it.Raw);
 	}
 	if (!out_disp_map_le.empty()) result.Outputs.DispMapLE = torch::cat(out_disp_map_le, 0);
@@ -255,7 +337,7 @@ LeRFRenderResult LeRFRenderer :: BatchifyRays(
 	if (!out_depth_map_le.empty()) result.Outputs.DepthMapLE = torch::cat(out_depth_map_le, 0);
 	if (!out_lang_embedding.empty()) result.Outputs.LangEmbedding = torch::cat(out_lang_embedding, 0);
 	if (!out_rendered_lang_embedding.empty()) result.Outputs.RenderedLangEmbedding = torch::cat(out_rendered_lang_embedding, 0);
-	if (!out_relevancy.empty()) result.Outputs.Relevancy = torch::cat(out_relevancy, 0);
+	if (!out_relevancy_map.empty()) result.Outputs.RelevancyMap = torch::cat(out_relevancy_map, 0);
 	if (!raw.empty()) result.Raw = torch::cat(raw, 0);
 
 	return result;
@@ -269,7 +351,8 @@ LeRFRenderResult LeRFRenderer :: Render(
 	const NeRFRenderParams &render_params,
 	std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rays /*= { torch::Tensor(), torch::Tensor(), torch::Tensor() }*/,			///array of shape[2, batch_size, 3].Ray origin and direction for each example in batch.
 	torch::Tensor c2w /*= torch::Tensor()*/,			///array of shape[3, 4].Camera - to - world transformation matrix.
-	torch::Tensor c2w_staticcam /*= torch::Tensor()*/			///array of shape[3, 4].If not None, use this transformation matrix for camera while using other c2w argument for viewing directions.
+	torch::Tensor c2w_staticcam /*= torch::Tensor()*/,			///array of shape[3, 4].If not None, use this transformation matrix for camera while using other c2w argument for viewing directions.
+	const std::function<bool()> &is_aborted /*= {}*/			///Cancellation hook polled between batches; return true to abort
 ) {
 	torch::Tensor rays_o, rays_d, cone_angle;
 	if (c2w.defined() && c2w.numel() != 0)
@@ -300,30 +383,38 @@ LeRFRenderResult LeRFRenderer :: Render(
 
 	auto rays_ = torch::cat({ rays_o, rays_d, near_, far_ }, -1);
 	
+	//Inference sweep geometry: the viewer path supplies no per-ray pyramid scales, so fall
+	//back to the rendered image height and fy (RenderRays rebuilds per-point world scales);
+	//downsampling cancels out: (H/f)*dist/(fy/f) == H*dist/fy, matching training
+	const float sweep_height = (render_params.LeRFImageHeight > 0.f) ? render_params.LeRFImageHeight : static_cast<float>(h);
+	const float sweep_fy = (render_params.LeRFFocalY > 0.f) ? render_params.LeRFFocalY : k[1][1].item<float>();
 	//Render and reshape
 	LeRFRenderResult all_ret = std::move(BatchifyRays(
 		rays_, render_params.ThinRay ? torch::Tensor() : cone_angle, render_params.NSamples, render_params.Chunk, render_params.ReturnRaw, render_params.LinDisp, render_params.Perturb,
-		render_params.NImportance, render_params.WhiteBkgr, render_params.RawNoiseStd, render_params.StochasticPreconditioningAlpha, render_params.BoundingBox, render_params.ReturnWeights
+		render_params.NImportance, render_params.WhiteBkgr, render_params.RawNoiseStd, render_params.StochasticPreconditioningAlpha, render_params.BoundingBox, render_params.ReturnWeights,
+		render_params.LeRFScales, sweep_height, sweep_fy, is_aborted, render_params.LeRFSweepScalesNorm
 	));
 
-	if (sh.size() > 2)			//не [4096, 3] а [800,800,3]
+	//A partial (aborted) result has fewer rows than h*w; reshaping it to the full image would throw
+	if (!all_ret.Aborted)
 	{
-		if (all_ret.Outputs.DispMapLE.numel() != 0)
-			all_ret.Outputs.DispMapLE = torch::reshape(all_ret.Outputs.DispMapLE, { sh[0], sh[1] });	//[640000] -> [800,800]
-		if (all_ret.Outputs.DepthMapLE.numel() != 0)
-			all_ret.Outputs.DepthMapLE = torch::reshape(all_ret.Outputs.DepthMapLE, { sh[0], sh[1] });
+		if (sh.size() > 2)			//не [4096, 3] а [800,800,3]
+		{
+			if (all_ret.Outputs.DispMapLE.numel() != 0)
+				all_ret.Outputs.DispMapLE = torch::reshape(all_ret.Outputs.DispMapLE, { sh[0], sh[1] });	//[640000] -> [800,800]
+			if (all_ret.Outputs.DepthMapLE.numel() != 0)
+				all_ret.Outputs.DepthMapLE = torch::reshape(all_ret.Outputs.DepthMapLE, { sh[0], sh[1] });
 
-		if (all_ret.Outputs.RenderedLangEmbedding.numel() != 0)
-			all_ret.Outputs.RenderedLangEmbedding = torch::reshape(all_ret.Outputs.RenderedLangEmbedding, { sh[0], sh[1], Lerf->GetLangEmbedDim() });
+			if (all_ret.Outputs.RenderedLangEmbedding.numel() != 0)
+				all_ret.Outputs.RenderedLangEmbedding = torch::reshape(all_ret.Outputs.RenderedLangEmbedding, { sh[0], sh[1], Lerf->GetLangEmbedDim() });
 
-		if (all_ret.Outputs.Relevancy.numel() != 0)
-			all_ret.Outputs.Relevancy = torch::reshape(all_ret.Outputs.Relevancy, { sh[0], sh[1], 2 });
-	} else {
-		if (all_ret.Outputs.RenderedLangEmbedding.numel() != 0)
-			all_ret.Outputs.RenderedLangEmbedding = torch::reshape(all_ret.Outputs.RenderedLangEmbedding, { sh[0], Lerf->GetLangEmbedDim() });
-
-		if (all_ret.Outputs.Relevancy.numel() != 0)
-			all_ret.Outputs.Relevancy = torch::reshape(all_ret.Outputs.Relevancy, { sh[0], 2 });
+			if (all_ret.Outputs.RelevancyMap.numel() != 0)
+				all_ret.Outputs.RelevancyMap = torch::reshape(all_ret.Outputs.RelevancyMap, { sh[0], sh[1] });
+		} else {
+			if (all_ret.Outputs.RenderedLangEmbedding.numel() != 0)
+				all_ret.Outputs.RenderedLangEmbedding = torch::reshape(all_ret.Outputs.RenderedLangEmbedding, { sh[0], Lerf->GetLangEmbedDim() });
+			if (all_ret.Outputs.RelevancyMap.numel() != 0)
+				all_ret.Outputs.RelevancyMap = torch::reshape(all_ret.Outputs.RelevancyMap, { sh[0] });		}
 	}
 	all_ret.Near = near_.min().item<float>();
 	all_ret.Far = far_.max().item<float>();

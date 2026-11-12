@@ -16,7 +16,6 @@
 #include <string>
 
 #include <opencv2/imgproc/imgproc.hpp>
-#include <opencv2/imgproc/types_c.h>
 #include <opencv2/highgui/highgui.hpp>
 
 const std::string DATA_DIR = "..//data//nerf_synthetic//drums";
@@ -183,7 +182,7 @@ int main(int argc, const char* argv[])
 	exparams.use_viewdirs = true;	//use full 5D input instead of 3D Не всегда нужна зависимость от направления обзора + обучение быстрее процентов на 30.
 	exparams.calculate_normals = false;
 	exparams.use_pred_normal = false;	//whether to use predicted normals
-	exparams.use_lerf = false;				//use language embedded radiance fields
+	exparams.use_lerf = true;				//use language embedded radiance fields
 	exparams.thin_ray = false;
 	exparams.multires_views = 8;		//log2 of max freq for positional encoding (2D direction)
 	exparams.n_importance = 192;//192;		//number of additional fine samples per ray
@@ -211,7 +210,10 @@ int main(int argc, const char* argv[])
 	exparams.hidden_dim_le = 256;				//Language embedder head params
 	exparams.lang_embed_dim = 768;			//Language embedder head params
 	exparams.geo_feat_dim_le = 32;			//Language embedder head params
-	exparams.pyr_embed_min_zoom_out = 0;
+	exparams.pyr_tile_size_min = std::min(float(exparams.clip_input_img_size) / 800/*Data.Views[0].W*/, float(exparams.clip_input_img_size) / 800/*Data.Views[0].H*/);	//0.05f;	//Pyramid min tile ratio
+	exparams.pyr_tile_size_max = 0.5f;	//Pyramid max tile ratio
+	exparams.pyr_tile_size_res = std::log2(exparams.pyr_tile_size_max / exparams.pyr_tile_size_min) * 2 + 1;		//Linear pyramid levels (7)
+	exparams.pyr_stride_scaler = 0.5f;	//Stride-scaler plateau
 	exparams.pyr_embedder_overlap = 0.5f;
 	exparams.path_to_clip = "..//..//RuCLIP//data//ruclip-vit-large-patch14-336";									//Path to RuClip model
 	exparams.path_to_bpe = "..//..//RuCLIP//data//ruclip-vit-large-patch14-336//bpe.model";			//Path to tokenizer
@@ -231,17 +233,17 @@ int main(int argc, const char* argv[])
 	params.NSamples = 64;						//number of coarse samples per ray
 	params.NRand = 32 * 32 * (exparams.use_lerf ? 1 : 16);		//batch size (number of random rays per gradient step), decrease if running out of memory >= Chunk, n*Chunk
 	params.PrecorpIters = 0;				//number of steps to train on central crops
-	params.NIters = 8100;
+	params.NIters = 7100;
 	params.LRateDecay = float(params.NIters) / 1000 * 2;				//exponential learning rate decay (in 1000 steps)  например: 150 - каждые 150000 итераций скорость обучения будет падать в 10 раз
 	//logging / saving options
 	params.IPrint = 100;						//frequency of console printout and metric loggin
 	params.IImg = 500;							//frequency of tensorboard image logging
-	params.IWeights = 8000;				//frequency of weight ckpt saving
-	params.ITestset = 8000;				//frequency of testset saving
+	params.IWeights = 7000;				//frequency of weight ckpt saving
+	params.ITestset = 7000;				//frequency of testset saving
 	params.ReturnRaw = false;
 	params.RenderFactor = 0;
 	params.PrecorpFrac = 0.5f;
-	params.PyramidClipEmbeddingSaveDir = DATA_DIR;			//
+	params.PyramidClipEmbeddingSaveDir = (std::filesystem::path(DATA_DIR) / "PyramidCache").string();			//
 
 	NeRFDatasetParams data = LoadDatasetParams(
 		DATA_DIR,
@@ -252,7 +254,11 @@ int main(int argc, const char* argv[])
 		false				///set to render synthetic data on a white bkgd (always use for dvoxels)
 	);
 
-	nerf_executor.Train(data, params);
+	try {
+		nerf_executor.Train(data, params);
+	} catch (const std::exception &e) {
+		std::cerr << "Train failed: " << e.what() << std::endl;
+	}
 
 	exparams.SaveToFile(params.BaseDir / "executor_params.json");
 	params.SaveToFile(params.BaseDir / "executor_train_params.json");

@@ -13,7 +13,7 @@ LeRFImpl :: LeRFImpl(
 		SigmaLENet->push_back(torch::nn::Linear(torch::nn::LinearOptions((l == 0) ? InputChLE : HiddenDimLE, (l == NumLayersLE - 1) ? (1 + GeoFeatDimLE) : HiddenDimLE/*, false*/).bias(false)));
 
 	for (int l = 0; l < NumLayersLE; l++)
-		LENet->push_back(torch::nn::Linear(torch::nn::LinearOptions((l == 0) ? GeoFeatDimLE + InputChLE : HiddenDimLE, (l == NumLayersLE - 1) ? (LangEmbedDim) : HiddenDimLE/*, false*/).bias(false)));	//CLIP embedding size
+		LENet->push_back(torch::nn::Linear(torch::nn::LinearOptions((l == 0) ? GeoFeatDimLE + InputChLE + 1 : HiddenDimLE, (l == NumLayersLE - 1) ? (LangEmbedDim) : HiddenDimLE/*, false*/).bias(false)));	//CLIP embedding size; +1 input = per-point scale
 
 	for (int i = 0; i < SigmaLENet->size(); i++)
 		register_module(module_name + "_sigma_le_net_" + std::to_string(i), SigmaLENet[i]);
@@ -25,7 +25,7 @@ LeRFImpl :: LeRFImpl(
 		register_module(module_name + "_le_net_" + std::to_string(i), LENet[i]);
 }
 
-torch::Tensor LeRFImpl :: forward(torch::Tensor x)
+torch::Tensor LeRFImpl :: forward(torch::Tensor x, torch::Tensor s)
 {
 	////Прямо из LE hash embedding в LeRF MLP
 	//torch::Tensor le;
@@ -75,6 +75,11 @@ torch::Tensor LeRFImpl :: forward(torch::Tensor x)
 
 	torch::Tensor inputs_le = x;
 
+	//Scale conditioning: the raw per-point scale in world units is concatenated as one extra input feature of the language head. Undefined/empty scale falls back to 1.0 (eval default, no sweep).
+	if (!s.defined() || s.numel() == 0)
+		s = torch::ones({ inputs_le.sizes()[0], 1 }, inputs_le.options());
+	auto scale_le = s.to(inputs_le.device()).to(inputs_le.scalar_type()).reshape({ -1, 1 });
+
 	//Полностью независимая сетка для LE со своей плотностью
 	torch::Tensor le,
 		sigma_le;
@@ -92,7 +97,7 @@ torch::Tensor LeRFImpl :: forward(torch::Tensor x)
 		auto geo_feat_le = h.index({ "...", torch::indexing::Slice(1, torch::indexing::None) });
 
 		//lerf
-		h = torch::cat({ geo_feat_le, inputs_le }, -1);
+		h = torch::cat({ geo_feat_le, inputs_le, scale_le }, -1);
 		for (int i = 0; i < LENet->size(); i++)
 		{
 			h = LENet[i]->as<torch::nn::Linear>()->forward(h);

@@ -21,7 +21,7 @@ BaseResolution(base_resolution), FinestResolution(finest_resolution), OutputDims
 {
 	//b = exp((log(finest_resolution) - log(base_resolution)) / (n_levels - 1));
 
-	Embeddings = register_parameter(module_name+"_embeddings", (torch::rand({(1ll << static_cast<long long>(log2_hashmap_size)) * NLevels, NFeaturesPerLevel}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)) /** .5f - 1.f*/) * 1e-4f, /*requires_grad = */true);
+	Embeddings = register_parameter(module_name+"_embeddings", (torch::rand({(1ll << static_cast<long long>(log2_hashmap_size)) * NLevels, NFeaturesPerLevel}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)) /** .5f - 1.f*/) * 5e-4f, /*requires_grad = */true);
 	CHECK(Embeddings.is_contiguous());
 
 	// Get prime numbers
@@ -36,7 +36,7 @@ BaseResolution(base_resolution), FinestResolution(finest_resolution), OutputDims
 
 	std::vector<int> prim_selected;
 	int min_local_prim = 1 << 28;
-	int max_local_prim = 1 << 30;
+	int max_local_prim = std::numeric_limits<int>::max();
 
 	for (int i = 0; i < 3 * NLevels * NVolumes; i++) 
 	{

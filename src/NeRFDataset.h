@@ -3,7 +3,7 @@
 #include "TorchHeader.h"
 #include "NeRFRenderer.h"
 #include "NeRFDatasetParams.h"
-#include "PyramidEmbedder.h"
+#include "PyramidEmbeddingDataloader.h"
 
 #include <future>
 #include <random>
@@ -25,6 +25,9 @@ struct RayBatch {
 struct TargetBatch {
 	torch::Tensor target_s;
 	torch::Tensor target_lang_embedding;
+	torch::Tensor target_lerf_scale;	///Per-ray pyramid scale normalized to [0,1] across the pyramid range
+	float target_image_height{ 0.f };	///View height in pixels (world-scale conversion happens in the renderer)
+	float target_focal_y{ 0.f };		///View focal length fy in pixels
 };
 
 ///Raybatch + targets
@@ -37,11 +40,7 @@ protected:
 	NeRFDatasetParams Params;
 
 	LeRFDatasetParams LeRFParams;
-	PyramidEmbedding PyramidClipEmbedding;
-	//torch::Tensor LerfPositives,
-	//	LerfNegatives;
-	CLIP Clip;
-	std::shared_ptr<RuCLIPProcessor> ClipProcessor;
+	std::unique_ptr<PyramidEmbeddingDataloader> PyramidClipEmbedding{nullptr};
 
 	int BatchSize,
 		PrecorpIters,
@@ -56,14 +55,14 @@ protected:
 		NextImage;
 	std::future<void> LoadingFuture;
 
-	///Генератор случайных чисел
+	///Генератор случайных чисел (используется только из главного потока)
 	std::mt19937 Rng;
 
 	int GetRandomTrainIdx();
 	torch::Tensor LoadImage(const int idx) const;
 	void PrefetchNextImage();
 	std::tuple<int, int, int, int> CalculateBounds() const;
-	void InitializePyramidClipEmbedding();
+	void InitializePyramidClipEmbedding(const CLIP clip, const std::shared_ptr<RuCLIPProcessor> clip_processor);
 public:
 	NeRFDataset(
 		const NeRFDatasetParams &params,
@@ -89,6 +88,6 @@ public:
 	///
 	NeRFDataExample get_batch(std::vector<size_t> request/*Не используется*/) override;
 	void SetCurrentIter(int iter) { CurrentIter = iter; }
-	PyramidEmbedding * GetPyramidClipEmbedding() { return &PyramidClipEmbedding; }
+	PyramidEmbeddingDataloader * GetPyramidClipEmbedding() { return PyramidClipEmbedding.get(); }
 	std::optional<size_t> size() const override { return torch::nullopt; /*Датасет бесконечен (он генерирует батчи на лету)*/ }
 };

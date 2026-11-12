@@ -25,7 +25,11 @@ public:
 
 	virtual ~LeRFImpl(){}
 
-	virtual torch::Tensor forward(torch::Tensor x) override;
+	///x: hash-grid embedding inputs; s: per-point scale in world units, empty = unit-scale default
+	torch::Tensor forward(torch::Tensor x, torch::Tensor s);
+
+	///Base-class virtual entry point: delegates to the scale-conditioned forward with the default scale
+	virtual torch::Tensor forward(torch::Tensor x) override { return forward(std::move(x), torch::Tensor()); }
 
 	virtual int GetLangEmbedDim() const {return LangEmbedDim;};
 };

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 4.4)
 
 #project(NeRF++)
 
@@ -34,8 +34,9 @@ set(SOURCES ${SOURCES}
 	../RuCLIP/src/RuCLIPProcessor.cpp
 	../RuCLIP/src/youtokentome/utf8.cpp
 	../RuCLIP/src/youtokentome/utils.cpp
-	../RuCLIP/src/youtokentome/bpe.cpp	
-	src/PyramidEmbedder.cpp
+	../RuCLIP/src/youtokentome/bpe.cpp
+	src/PatchEmbeddingDataloader.cpp
+	src/PyramidEmbeddingDataloader.cpp
 	src/LeRF.cpp
 	src/LeRFRenderer.cpp
 	src/NeRFactor.cpp
@@ -66,7 +67,8 @@ set(HEADERS ${HEADERS}
 	../RuCLIP/src/youtokentome/utils.h
 	../RuCLIP/src/youtokentome/bpe.h
 	../RuCLIP/src/RuCLIPProcessor.h
-	src/PyramidEmbedder.h
+	src/PatchEmbeddingDataloader.h
+	src/PyramidEmbeddingDataloader.h
 	src/LeRF.h
 	src/LeRFRenderer.h
 	src/NeRFactor.h

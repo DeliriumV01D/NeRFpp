@@ -3,9 +3,11 @@
 #include "RayUtils.h"
 #include "Sampler.h"
 #include "CustomOps.h"
+#include <functional>
+#include <vector>
+#include <ATen/cuda/CUDAContext.h>
 
 #include <opencv2/imgproc/imgproc.hpp>
-#include <opencv2/imgproc/types_c.h>
 #include <opencv2/highgui/highgui.hpp>
 
 ///
@@ -23,6 +25,7 @@ struct NeRFRenderResult
 	torch::Tensor Raw;	///[num_rays, num_samples, 4] .Raw predictions from model.
 	float Near,
 		Far;
+	bool Aborted{false};		///True if rendering was cancelled between batches; maps hold a partial result
 };
 
 struct NeRFRenderParams {
@@ -40,13 +43,23 @@ struct NeRFRenderParams {
 	bool ThinRay{false};
 	float RenderFactor{0};
 	torch::Tensor BoundingBox{torch::Tensor()};
+	torch::Tensor LeRFScales{torch::Tensor()};
+	float LeRFImageHeight{0.f};
+	float LeRFFocalY{0.f};
+	///Actual pyramid tile-scale levels for the LeRF inference relevancy sweep, normalized with the
+	///training formula s_norm = (level - t_min) / (t_max - t_min) (identical to NeRFDataset::get_batch).
+	///Empty -> the renderer falls back to its legacy hardcoded 4-point sweep list.
+	std::vector<float> LeRFSweepScalesNorm;
 	float StochasticPreconditioningAlpha{0};	///добавляет шум к входу сети (координатам точек). Уменьшает чувствительность к инициализации. Помогает избежать "плавающих" артефактов
 };
 
-inline torch::Tensor CVMatToTorchTensor(cv::Mat img, const bool perm = false)
+inline torch::Tensor CVMatToTorchTensor(cv::Mat img, const bool perm = false, const bool convert_to_rgb = false)
 {
 	if (!img.isContinuous())
 		img = img.clone();
+	//CLIP normalization constants are RGB-ordered; OpenCV decodes to BGR - the swap is opt-in
+	if (convert_to_rgb)
+		cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
 	auto tensor_image = torch::from_blob(img.data, { img.rows, img.cols, img.channels() }, at::kByte);
 	if (perm)
 		tensor_image = tensor_image.permute({ 2,0,1 });
@@ -55,7 +68,7 @@ inline torch::Tensor CVMatToTorchTensor(cv::Mat img, const bool perm = false)
 	return tensor_image;
 }
 
-inline cv::Mat TorchTensorToCVMat(torch::Tensor tensor_image, const bool perm = false)
+inline cv::Mat TorchTensorToCVMat(torch::Tensor tensor_image, const bool perm = false, const bool convert_to_rgb = false)
 {
 	auto t = tensor_image.detach().squeeze().cpu();
 	if (perm)
@@ -64,6 +77,9 @@ inline cv::Mat TorchTensorToCVMat(torch::Tensor tensor_image, const bool perm = 
 	t = t.contiguous();
 	cv::Mat result_img;
 	cv::Mat((int)t.size(0), (int)t.size(1), (int)CV_MAKETYPE(CV_8U, t.sizes().size() >= 3 ? t.size(2) : 1), t.data_ptr()).copyTo(result_img);
+	//Inverse of the BGR2RGB conversion in CVMatToTorchTensor: restore OpenCV's native BGR channel order
+	if (convert_to_rgb && result_img.channels() == 3)
+		cv::cvtColor(result_img, result_img, cv::COLOR_RGB2BGR);
 	return result_img;
 }
 
@@ -100,6 +116,7 @@ protected:
 		torch::Tensor raw,			///raw : [num_rays, num_samples along ray, 4+3+(3)] .Prediction from model.
 		torch::Tensor cone_angle,
 		torch::Tensor z_vals,		///z_vals : [num_rays, num_samples along ray] .Integration time.
+		torch::Tensor near,
 		torch::Tensor rays_d,		///rays_d : [num_rays, 3] .Direction of each ray.
 		const float raw_noise_std = 0.f,
 		const bool white_bkgr = false
@@ -143,7 +160,8 @@ public:
 		const float raw_noise_std = 0.,
 		const float stochastic_preconditioning_alpha = 0.f,
 		torch::Tensor bounding_box  = torch::Tensor(),
-		const bool return_weights = true
+		const bool return_weights = true,
+		const std::function<bool()> &is_aborted = {}			///Cancellation hook polled between batches; return true to abort
 	);
 
 	///Если определены позиции c2w то rays не нужен т.к.не используется (задавать либо pose c2w либо rays)
@@ -154,7 +172,8 @@ public:
 		const NeRFRenderParams &render_params,
 		std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rays = { torch::Tensor(), torch::Tensor(), torch::Tensor() },			///array of shape[2, batch_size, 3].Ray origin and direction for each example in batch.
 		torch::Tensor c2w = torch::Tensor(),			///array of shape[3, 4].Camera - to - world transformation matrix.
-		torch::Tensor c2w_staticcam = torch::Tensor()			///array of shape[3, 4].If not None, use this transformation matrix for camera while using other c2w argument for viewing directions.
+		torch::Tensor c2w_staticcam = torch::Tensor(),			///array of shape[3, 4].If not None, use this transformation matrix for camera while using other c2w argument for viewing directions.
+		const std::function<bool()> &is_aborted = {}			///Cancellation hook polled between batches; return true to abort
 	);
 };			//NeRFRenderer
 
@@ -170,7 +189,6 @@ torch::Tensor NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> ::RunNetwork(
 ) {
 	//можно попробовать научить работать эмбедер с батчами чтобы не плющить тензоры?
 	torch::Tensor inputs_flat = inputs.view({ -1, inputs.sizes().back()/*[-1]*/ });  //[1024, 256, 3] -> [262144, 3]
-	inputs_flat.set_requires_grad(false);
 	
 	auto [embedded, keep_mask] = embed_fn->forward(inputs_flat);
 
@@ -200,6 +218,7 @@ NeRFRendererOutputs NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: RawToOutputs(
 	torch::Tensor raw,			///raw : [num_rays, num_samples along ray, 4+3+(3)] .Prediction from model.
 	torch::Tensor cone_angle,
 	torch::Tensor z_vals,		///z_vals : [num_rays, num_samples along ray] .Integration time.
+	torch::Tensor near,
 	torch::Tensor rays_d,		///rays_d : [num_rays, 3] .Direction of each ray.
 	const float raw_noise_std /*= 0.f*/,
 	const bool white_bkgr /*= false*/
@@ -219,25 +238,27 @@ NeRFRendererOutputs NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: RawToOutputs(
 		//	auto dists_segments = dists.index({ "...", torch::indexing::Slice(torch::indexing::None, -1) });  // [N_rays, N_samples-1]
 		//	//Объем усеченного конуса: v = (π/3) * h * (r₁² + r₁*r₂ + r₂²)
 		//	//auto volume_segments = (M_PI / 3.0f) * dists_segments * (r_start.square() + r_start * r_end + r_end.square());  // [N_rays, N_samples-1]
-		//	auto safe_volume = [](torch::Tensor h, torch::Tensor r1, torch::Tensor r2, float eps = 1e-10f) {
+		//	auto safe_volume = [](torch::Tensor h, torch::Tensor r1, torch::Tensor r2, float eps = 1e-10f)
+		//	{
 		//		r1 = torch::clamp_min(r1, eps);
 		//		r2 = torch::clamp_min(r2, eps);
 		//		h = torch::clamp_min(h, eps);
 		//		return (M_PI / 3.0f) * h * (r1.square() + r1 * r2 + r2.square());
 		//	};
-		//	auto volume_segments = safe_volume(dists_segments, r_start, r_end);			
+		//	auto volume_segments = safe_volume(dists_segments, r_start, r_end);
 		//	auto volume = torch::cat({ volume_segments, volume_segments.index({ "...", torch::indexing::Slice(-1, torch::indexing::None) }) }, -1);  // [N_rays, N_samples]
 		//	//return - torch::autograd::TruncExp::apply(- torch::relu(raw) * volume)[0] + 1.f;
-		//	return 1.0f - torch::exp(-torch::clamp(torch::relu(raw) * torch::clamp(volume, 1e-10f, 1e10f), 0.0f, 80.0f));
+		//	return 1.0f - torch::autograd::TruncExp::apply(-torch::clamp(torch::relu(raw) * torch::clamp(volume, 1e-10f, 1e10f), -80.0f, 80.0f))[0];
 		//} else {
 			//Стандартный NeRF (бесконечно тонкий луч)
-			return - torch::autograd::TruncExp::apply(- torch::relu(raw) * dists)[0] + 1.f;
+			return 1.f - torch::exp(- torch::clamp(torch::relu(raw) * dists.contiguous(), 0.0f, 38.0f));
 		//}
 	};
 
 	//Вычисление расстояний между сэмплами
 	auto dists = z_vals.index({ "...", torch::indexing::Slice(1, torch::indexing::None) }) - z_vals.index({ "...", torch::indexing::Slice(torch::indexing::None, -1) });
-	dists = torch::cat({ dists, (torch::ones(1, torch::kFloat32) * 1e10).expand(dists.index({ "...", torch::indexing::Slice(torch::indexing::None, 1) }).sizes()).to(device)}, -1);  // [N_rays, N_samples]
+	//dists = torch::cat({ dists, dists.index({ "...", torch::indexing::Slice(-1, torch::indexing::None) }) }, -1);
+	dists = torch::cat({ dists, (torch::ones(1, torch::kFloat32) * 1e8).expand(dists.index({ "...", torch::indexing::Slice(torch::indexing::None, 1) }).sizes()).to(device)}, -1);  // [N_rays, N_samples]
 	dists = dists * torch::norm(rays_d.index({ "...", torch::indexing::None, torch::indexing::Slice() }), 2/*L2*/, /*dim*/-1);
 	if (!dists.requires_grad())
 		dists.set_requires_grad(true);
@@ -245,7 +266,7 @@ NeRFRendererOutputs NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: RawToOutputs(
 	//Вычисление радиусов конуса для каждой точки. Радиус конуса линейно растет с расстоянием
 	torch::Tensor cone_radii;
 	if (cone_angle.defined() && cone_angle.numel()) //if (cone_angle > 0.0f)
-		cone_radii = cone_angle * z_vals;  // [N_rays, N_samples]
+		cone_radii = cone_angle * (z_vals + near);  // [N_rays, N_samples];  // [N_rays, N_samples]
 
 	auto rgb = torch::sigmoid(raw.index({ "...", torch::indexing::Slice(torch::indexing::None, 3) }));		//[N_rays, N_samples, 3] извлекает значения из первых трех столбцов тензора raw
 	
@@ -254,20 +275,18 @@ NeRFRendererOutputs NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: RawToOutputs(
 		density_before_activation = density_before_activation + torch::randn_like(density_before_activation) * raw_noise_std;
 
 	torch::Tensor alpha = raw2alpha_with_volume(density_before_activation, dists, cone_radii);  //[N_rays, N_samples]
-	//result.Weights = alpha * torch::cumprod(
-	//	torch::cat({ torch::ones({alpha.sizes()[0]/*nrays*/, 1}).to(device), -alpha + 1.f + 1e-10f }, -1), -1
-	//).index({ torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, -1) });
-	auto compute_weights_in_log_space = [](torch::Tensor alpha, torch::Device device)
-	{
-		//Вычисляем log(1 - alpha) с защитой от log(0)
-		auto log_transmittance = torch::cat({
-				torch::zeros({alpha.size(0)/*nrays*/, 1}, torch::TensorOptions().device(device)),
-				torch::cumsum(torch::log(torch::clamp_min(1.0f - alpha, 1e-10f)), -1)
-			}, -1).index({ torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, -1) });
-		auto weights = alpha * torch::autograd::TruncExp::apply(log_transmittance)[0];
-		return weights;
-	};
-	result.Weights = compute_weights_in_log_space(alpha, device);
+	
+	//auto compute_weights_in_log_space = [](torch::Tensor alpha, torch::Device device)
+	//{
+	//	//Вычисляем log(1 - alpha) с защитой от log(0)
+	//	auto log_transmittance = torch::cumsum(torch::log(torch::clamp(1.0f - alpha, 1e-8f, 1.f)), -1);
+	//	auto weights = alpha * torch::exp(log_transmittance)[0];
+	//	return weights;
+	//};
+	//result.Weights = compute_weights_in_log_space(alpha, device);
+	result.Weights = alpha * torch::cumprod(
+		torch::cat({ torch::ones({alpha.sizes()[0]/*nrays*/, 1}).to(device), torch::clamp(1.f - alpha , 1e-8f, 1.f) }, -1), -1
+	).index({ torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, -1) });
 	result.RGBMap = torch::sum(result.Weights.index({ "...", torch::indexing::None }) * rgb, -2);  //[N_rays, 3]
 	result.DepthMap = torch::sum(result.Weights * z_vals, -1) / torch::clamp_min(torch::sum(result.Weights, -1), 1e-10f);
 	result.DispMap = 1. / torch::max(1e-10 * torch::ones_like(result.DepthMap), result.DepthMap);
@@ -304,14 +323,14 @@ inline torch::Tensor ReflectBoundary(torch::Tensor pts, torch::Tensor min_bound,
 }
 
 ///Сэмплим в расходящимся конусе
-inline torch::Tensor TangentScatter(torch::Tensor pts, torch::Tensor z_vals, torch::Tensor cone_angle, torch::Tensor rays_d, torch::Device device, torch::Tensor bounding_box)
+inline torch::Tensor TangentScatter(torch::Tensor pts, torch::Tensor z_vals, torch::Tensor near, torch::Tensor cone_angle, torch::Tensor rays_d, torch::Device device, torch::Tensor bounding_box)
 {
 	if (cone_angle.defined() && cone_angle.numel())//if (cone_angle > 0.0f)
 	{
 		auto safe_normalize = [](torch::Tensor v, float eps = 1e-8f) {auto norm = torch::norm(v, 2, -1, true).clamp_min(eps); return v / norm; };
 
 		//Вычисление радиусов конуса для каждой точки. Радиус конуса линейно растет с расстоянием
-		torch::Tensor cone_radii = cone_angle * z_vals;  // [N_rays, N_samples]
+		torch::Tensor cone_radii = cone_angle * (z_vals + near);  // [N_rays, N_samples]
 		//Добавление случайного смещения в пределах конуса. Это имитирует интегрирование по объему конуса
 		//Генерируем случайные направления, перпендикулярные лучу
 		auto rays_d_norm = safe_normalize(rays_d);
@@ -417,10 +436,10 @@ NeRFRenderResult NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: RenderRays(
 	}
 
 	auto pts = rays_o.index({ "...", torch::indexing::None, torch::indexing::Slice() }) + rays_d.index({ "...", torch::indexing::None, torch::indexing::Slice() }) * z_vals.index({ "...", torch::indexing::Slice(), torch::indexing::None}); //[N_rays, N_samples, 3]
-	pts = TangentScatter(pts, z_vals, cone_angle, rays_d, device, bounding_box);
+	pts = TangentScatter(pts, z_vals, near, cone_angle, rays_d, device, bounding_box);
 
 	torch::Tensor raw = RunNetwork(pts, viewdirs, /*torch::Tensor(),*/ NeRF, EmbedFn, EmbeddirsFn);
-	auto outputs1 = RawToOutputs(raw, cone_angle, z_vals, rays_d, raw_noise_std, white_bkgr);
+	auto outputs1 = RawToOutputs(raw, cone_angle, z_vals, near, rays_d, raw_noise_std, white_bkgr);
 
 	if (n_importance > 0)
 	{
@@ -431,23 +450,25 @@ NeRFRenderResult NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: RenderRays(
 		std::tie(z_vals, z_indices) = torch::sort(torch::cat({ z_vals, z_samples }, -1), -1);
 		pts = rays_o.index({ "...", torch::indexing::None, torch::indexing::Slice() }) + rays_d.index({ "...", torch::indexing::None, torch::indexing::Slice() }) * z_vals.index({ "...", torch::indexing::Slice(), torch::indexing::None }); // [N_rays, N_samples + N_importance, 3]
 		
+		pts = TangentScatter(pts, z_vals, near, cone_angle, rays_d, device, bounding_box);
+
 		//Применяем стохастическое предобуславливание
 		if (stochastic_preconditioning_alpha > 0.0f)
 		{
 			std::vector<torch::Tensor> bounds = torch::split(bounding_box, { 3, 3 }, -1);
 			auto min_bound = bounds[0].to(device);
 			auto max_bound = bounds[1].to(device);
-			auto noise =  torch::randn_like(pts) * stochastic_preconditioning_alpha;
+			auto noise = torch::randn_like(pts) * stochastic_preconditioning_alpha;
 			pts = pts + noise.to(device);
 			pts = ReflectBoundary(pts, min_bound, max_bound);	//Обрабатываем границы отражением
 		}
 
-		pts = TangentScatter(pts, z_vals, cone_angle, rays_d, device, bounding_box);
-
 		raw = RunNetwork(pts, viewdirs, NeRF, EmbedFn, EmbeddirsFn);
-		result.Outputs = RawToOutputs(raw, cone_angle, z_vals, rays_d, raw_noise_std, white_bkgr);
+		result.Outputs = RawToOutputs(raw, cone_angle, z_vals, near, rays_d, raw_noise_std, white_bkgr);
 		//result.ZStd = torch::std(z_samples, -1, false);  // [N_rays]
 	}		//if (n_importance > 0)
+		else
+			result.Outputs = outputs1;
 
 	if (return_raw)
 		result.Raw = raw;
@@ -475,13 +496,20 @@ NeRFRenderResult NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: BatchifyRays(
 	const float raw_noise_std /*= 0.*/,
 	const float stochastic_preconditioning_alpha /*= 0.f*/,
 	torch::Tensor bounding_box /* = torch::Tensor()*/,
-	const bool return_weights /*= true*/
+	const bool return_weights /*= true*/,
+	const std::function<bool()> &is_aborted /*= {}*/
 ) {
 	NeRFRenderResult result;
 	std::vector<NeRFRenderResult> all_results;
 	all_results.reserve(rays_flat.sizes()[0] / chunk);
 	for (int i = 0; i < rays_flat.sizes()[0]; i += chunk)
 	{
+		//Cooperative cancellation point: an abort is noticed within at most one chunk of GPU work
+		if (is_aborted && is_aborted())
+		{
+			result.Aborted = true;
+			break;
+		}
 		all_results.emplace_back(RenderRays(
 			rays_flat.index({ torch::indexing::Slice(i, ((i + chunk) <= rays_flat.sizes()[0])?(i+chunk):(rays_flat.sizes()[0])) }),
 			cone_angle,/*пока скаляр, потом .index({ torch::indexing::Slice(i, ((i + chunk) <= cone_angle.sizes()[0]) ? (i + chunk) : (cone_angle.sizes()[0])) }),*/
@@ -496,6 +524,12 @@ NeRFRenderResult NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: BatchifyRays(
 			bounding_box,
 			return_weights
 		));
+		//Pacing (interactive only): wait until the GPU has actually executed this chunk.
+		//Without it the host enqueues the whole level in microseconds and blocks in the
+		//end-of-level item<float>() sync, so the cancellation check above would only fire
+		//between fully executed levels, making the whole level the indivisible unit of work.
+		if (is_aborted && rays_flat.is_cuda())
+			at::cuda::getCurrentCUDAStream().synchronize();
 	}
 	//Слить all_results в один RenderResult используя torch::cat(torch::TensorList - at::ArrayRef ...
 	//!!!make this part cleaner and shorter
@@ -534,7 +568,8 @@ NeRFRenderResult NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: Render(
 	const NeRFRenderParams &render_params,
 	std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rays /*= { torch::Tensor(), torch::Tensor() }*/,			///array of shape[2, batch_size, 3].Ray origin and direction for each example in batch.
 	torch::Tensor c2w /*= torch::Tensor()*/,			///array of shape[3, 4].Camera - to - world transformation matrix.
-	torch::Tensor c2w_staticcam /*= torch::Tensor()*/			///array of shape[3, 4].If not None, use this transformation matrix for camera while using other c2w argument for viewing directions.
+	torch::Tensor c2w_staticcam /*= torch::Tensor()*/,			///array of shape[3, 4].If not None, use this transformation matrix for camera while using other c2w argument for viewing directions.
+	const std::function<bool()> &is_aborted /*= {}*/
 ) {
 	torch::Tensor rays_o, rays_d, cone_angle;
 	if (c2w.defined() && c2w.numel() != 0)
@@ -556,7 +591,7 @@ NeRFRenderResult NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: Render(
 			//special case to visualize effect of viewdirs
 			std::tie(rays_o, rays_d, cone_angle) = GetRays(h, w, k, c2w_staticcam);
 		}
-		viewdirs = viewdirs / torch::norm(viewdirs, 2/*L2*/, -1/*dim*/, true);
+		//viewdirs = viewdirs / torch::norm(viewdirs, 2/*L2*/, -1/*dim*/, true);		//Уже сделано в GetRays
 		viewdirs = torch::reshape(viewdirs, { -1, 3 });//.float();
 	}
 
@@ -585,19 +620,23 @@ NeRFRenderResult NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: Render(
 	//Renderand reshape
 	NeRFRenderResult all_ret = std::move(BatchifyRays(
 		rays_, render_params.ThinRay ? torch::Tensor() : cone_angle, render_params.NSamples, render_params.Chunk, render_params.ReturnRaw, render_params.LinDisp, render_params.Perturb,
-		render_params.NImportance, render_params.WhiteBkgr, render_params.RawNoiseStd, render_params.StochasticPreconditioningAlpha, render_params.BoundingBox, render_params.ReturnWeights
+		render_params.NImportance, render_params.WhiteBkgr, render_params.RawNoiseStd, render_params.StochasticPreconditioningAlpha, render_params.BoundingBox, render_params.ReturnWeights,
+		is_aborted
 	));
 
-	if (all_ret.Outputs.RGBMap.numel() != 0)
-		all_ret.Outputs.RGBMap = torch::reshape(all_ret.Outputs.RGBMap, sh);		//[640000, 3] -> [800, 800, 3]
-
-	if (sh.size() > 2)			//не [4096, 3] а [800,800,3]
+	if (!all_ret.Aborted)
 	{
-		if (all_ret.Outputs.DispMap.numel() != 0)
-			all_ret.Outputs.DispMap = torch::reshape(all_ret.Outputs.DispMap, { sh[0], sh[1] });	//[640000] -> [800,800]
-		if (all_ret.Outputs.DepthMap.numel() != 0)
-			all_ret.Outputs.DepthMap = torch::reshape(all_ret.Outputs.DepthMap, { sh[0], sh[1] });
-	} else {
+		if (all_ret.Outputs.RGBMap.numel() != 0)
+			all_ret.Outputs.RGBMap = torch::reshape(all_ret.Outputs.RGBMap, sh);		//[640000, 3] -> [800, 800, 3]
+
+		if (sh.size() > 2)			//не [4096, 3] а [800,800,3]
+		{
+			if (all_ret.Outputs.DispMap.numel() != 0)
+				all_ret.Outputs.DispMap = torch::reshape(all_ret.Outputs.DispMap, { sh[0], sh[1] });	//[640000] -> [800,800]
+			if (all_ret.Outputs.DepthMap.numel() != 0)
+				all_ret.Outputs.DepthMap = torch::reshape(all_ret.Outputs.DepthMap, { sh[0], sh[1] });
+		} else {
+		}
 	}
 	all_ret.Near = near_.min().item<float>();
 	all_ret.Far = far_.max().item<float>();

@@ -5,10 +5,10 @@
 ///Hierarchical sampling
 inline torch::Tensor SamplePDF(torch::Tensor bins, torch::Tensor weights, const int nsamples, const bool det /*= false*/)
 {
+	float eps = 1e-5f;
 	torch::Device device = weights.device();
 	//Get probability density function (PDF)
-	weights = weights + 1e-8;
-	auto pdf = weights / torch::sum(weights, -1, true);
+	auto pdf = (weights + eps)/ torch::sum(weights + eps, -1, true);
 	auto cdf = torch::cumsum(pdf, -1);
 	cdf = torch::cat({ torch::zeros_like(cdf.index({ "...", torch::indexing::Slice(torch::indexing::None, 1)})), cdf }, -1);		//[batch, len(bins)]
 	torch::Tensor u;
@@ -35,7 +35,7 @@ inline torch::Tensor SamplePDF(torch::Tensor bins, torch::Tensor weights, const 
 	auto bins_g = torch::gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g);
 
 	auto denom = (cdf_g.index({ "...", 1 }) - cdf_g.index({ "...", 0 }));
-	denom = torch::where(denom < 1e-5, torch::ones_like(denom), denom);
+	denom = torch::where(denom < eps, torch::ones_like(denom), denom);
 	auto t = (u - cdf_g.index({ "...", 0 })) / denom;
 	auto samples = bins_g.index({ "...", 0 }) + t * (bins_g.index({ "...", 1 }) - bins_g.index({ "...", 0 }));
 

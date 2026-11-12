@@ -9,14 +9,12 @@ NeRFDataset :: NeRFDataset(
 	torch::Device device,
 	const CLIP clip,
 	const std::shared_ptr<RuCLIPProcessor> clip_processor
-) : Params(params), LeRFParams(lerf_params), BatchSize(batch_size), PrecorpIters(precorp_iters), PrecorpFrac(precorp_frac), Device(device),
-Clip(clip), ClipProcessor(clip_processor), Rng(std::random_device{}())
+) : Params(params), LeRFParams(lerf_params), BatchSize(batch_size), PrecorpIters(precorp_iters), PrecorpFrac(precorp_frac), Device(device), Rng(std::random_device{}())
 {
-	InitializePyramidClipEmbedding();
-	//Загрузка первого изображения
+	InitializePyramidClipEmbedding(clip, clip_processor);
+	//Load the first image and start async prefetch of the next one
 	CurrentImageIdx = GetRandomTrainIdx();
 	CurrentImage = LoadImage(CurrentImageIdx);
-	//Предзагрузка следующего изображения
 	PrefetchNextImage();
 }
 
@@ -29,10 +27,10 @@ int NeRFDataset :: GetRandomTrainIdx()
 torch::Tensor NeRFDataset :: LoadImage(const int idx) const
 {
 	const auto &path = Params.Views[idx].ImagePath;
-	cv::Mat img = cv::imread(path.string(), cv::IMREAD_COLOR/*cv::IMREAD_UNCHANGED*/);		//keep all 4 channels(RGBA)
+	cv::Mat img = cv::imread(path.string(), cv::IMREAD_COLOR/*cv::IMREAD_UNCHANGED*/); //keep all 4 channels(RGBA)
 	if (img.empty())
 		throw std::runtime_error("NeRFDataset :: LoadImage error: Failed to load image: " + path.string());
-	return CVMatToTorchTensor(img).squeeze(0).to(Device);		//1, 800, 800, 3(4) -> 800, 800, 3(4)
+	return CVMatToTorchTensor(img).squeeze(0).clone().to(Device); // (1, H, W, 3) -> (H, W, 3)
 }
 
 void NeRFDataset :: PrefetchNextImage()
@@ -64,43 +62,39 @@ std::tuple<int, int, int, int> NeRFDataset :: CalculateBounds() const
 	return { h_start, h_end, w_start, w_end };
 }
 
-void NeRFDataset :: InitializePyramidClipEmbedding()
-{
-	try {
-		if (LeRFParams.UseLerf)
-		{
-			PyramidEmbedderProperties pyramid_embedder_properties;
-			pyramid_embedder_properties.ImgSize = { LeRFParams.clip_input_img_size, LeRFParams.clip_input_img_size };	//Входной размер изображения сети
-			pyramid_embedder_properties.Overlap = LeRFParams.pyr_embedder_overlap;										///Доля перекрытия
-			pyramid_embedder_properties.MinZoomOut = LeRFParams.MinZoomOut;		//0 or -1
-			///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0 , 1, 2...
-			int wmax = 0,
-				hmax = 0;
-			for (auto &view : Params.Views)
-			{
-				if (view.H > hmax)
-					hmax = view.H;
-				if (view.W > wmax)
-					wmax = view.W;
-			}
-			pyramid_embedder_properties.MaxZoomOut = std::min(log2f(wmax / LeRFParams.clip_input_img_size), log2f(hmax / LeRFParams.clip_input_img_size));
-			PyramidEmbedder PyramidClipEmbedder(Clip, ClipProcessor, pyramid_embedder_properties);
 
-			if (!std::filesystem::exists(LeRFParams.PyramidClipEmbeddingSaveDir / "pyramid_embeddings.pt"))
-			{
-				std::cout << "calculating pyramid embeddings..." << std::endl;
-				///Разбить на патчи с перекрытием  +  парочку масштабов (zoomout) и кэшировать эмбеддинги от них
-				PyramidClipEmbedding = PyramidClipEmbedder(Params);
-				PyramidClipEmbedding.Save(LeRFParams.PyramidClipEmbeddingSaveDir / "pyramid_embeddings.pt");
-			}
-			else {
-				std::cout << "loading pyramid embeddings..." << std::endl;
-				PyramidClipEmbedding.Load(LeRFParams.PyramidClipEmbeddingSaveDir / "pyramid_embeddings.pt");
-			}
-		}
+
+
+void NeRFDataset :: InitializePyramidClipEmbedding(const CLIP clip, const std::shared_ptr<RuCLIPProcessor> clip_processor)
+{
+
+	if (!LeRFParams.UseLerf) {
+		PyramidClipEmbedding = nullptr;
+		return;
 	}
-	catch (std::exception &e) {
-		std::cout << e.what() << std::endl;
+
+	//Собираем конфиг для PyramidEmbeddingDataloader
+	int wmax = 0, hmax = 0;
+	for (const auto &view : Params.Views)
+	{
+		wmax = std::max(wmax, view.W);
+		hmax = std::max(hmax, view.H);
+	}
+	std::vector<int64_t> image_shape = { hmax, wmax };
+
+	PyramidEmbeddingDataloaderProperties pyramid_cfg;
+	pyramid_cfg.TileSizeRange = { LeRFParams.pyr_tile_size_min, LeRFParams.pyr_tile_size_max };	//Pyramid scales follow the original LeRF defaults (kerrj/lerf): absolute tile_size_range as a fraction of image size
+	pyramid_cfg.TileSizeRes = LeRFParams.pyr_tile_size_res;			//tile_size_res linear levels; values come from NeRFExecutorParams config via LeRFDatasetParams
+	pyramid_cfg.StrideScaler = LeRFParams.pyr_stride_scaler;	//Per-level stride_ratio is interpolated by PyramidEmbeddingDataloader::StrideScaler() over ratio range [0.05, 0.15] -> [1.0, StrideScaler].
+	pyramid_cfg.ImageShape = image_shape;
+	pyramid_cfg.ModelName = "pyramid";
+
+	try {
+		PyramidClipEmbedding = std::make_unique<PyramidEmbeddingDataloader>(pyramid_cfg, Device, clip, clip_processor, Params, LeRFParams.PyramidClipEmbeddingSaveDir);
+		std::cout << "PyramidEmbeddingDataloader initialized successfully." << std::endl;
+	} catch (const std::exception &e) {
+		std::cerr << "Failed to initialize PyramidEmbeddingDataloader: " << e.what() << std::endl;
+		throw;
 	}
 }
 
@@ -157,41 +151,29 @@ NeRFDataExample NeRFDataset :: get_batch(std::vector<size_t> request/*Не ис�
 	auto [rays_o, rays_d, cone_angle] = GetRayBatch(rand_h, rand_w, Params.Views[CurrentImageIdx].H, Params.Views[CurrentImageIdx].W, Params.Views[CurrentImageIdx].K.to(Device), pose);		//Вычисляем лучи
 
 	//!!!->class LeRFDataset
-	///Вычислим CLIP эмбеддинги в точках изображения которые попали в батч
-	torch::Tensor target_lang_embedding;
-	if (LeRFParams.UseLerf)
+	///Compute CLIP embeddings at the image points that landed in this batch
+	torch::Tensor target_lang_embedding,
+		target_lerf_scale;
+	if (LeRFParams.UseLerf && PyramidClipEmbedding)
 	{
-		PyramidEmbedderProperties pyramid_embedder_properties;
-		pyramid_embedder_properties.ImgSize = { LeRFParams.clip_input_img_size, LeRFParams.clip_input_img_size };	//Входной размер изображения сети
-		pyramid_embedder_properties.Overlap = LeRFParams.pyr_embedder_overlap;										///Доля перекрытия
-		pyramid_embedder_properties.MinZoomOut = LeRFParams.MinZoomOut;
-		///Максимальное удаление (h, w) = (h_base, w_baser) * pow(2, zoom_out);		//-1, 0, 1, 2...
-		int wmax = 0,
-			hmax = 0;
-		for (auto &view : Params.Views)
-		{
-			if (view.H > hmax)
-				hmax = view.H;
-			if (view.W > wmax)
-				wmax = view.W;
-		}
-		pyramid_embedder_properties.MaxZoomOut = std::min(log2f(wmax / LeRFParams.clip_input_img_size), log2f(hmax / LeRFParams.clip_input_img_size));
-		//auto select_coords_cpu = select_coords.to(torch::kCPU).to(torch::kFloat);		//!!!.item<long>()почему то не находит поэтому преобразуем во float
-		target_lang_embedding = torch::ones({ BatchSize, LeRFParams.lang_embed_dim }, torch::kFloat32);
+		//All views are resized to Config.ImageShape when the pyramid is built, so native view coords must be rescaled accordingly
+		const auto &pyr_shape = PyramidClipEmbedding->GetImageShape();
+		float scale_h = static_cast<float>(pyr_shape[0]) / static_cast<float>(Params.Views[CurrentImageIdx].H);
+		float scale_w = static_cast<float>(pyr_shape[1]) / static_cast<float>(Params.Views[CurrentImageIdx].W);
 
-		#pragma omp parallel for
-		for (int idx = 0; idx < rand_h.size(0)/*NRand*/; idx++)
-		{
-			target_lang_embedding.index_put_({ idx/*, torch::indexing::Slice()*/ }, PyramidClipEmbedding.GetPixelValue(
-				rand_h.index({ idx }).to(torch::kCPU).to(torch::kFloat).item<float>(),
-				rand_w.index({ idx }).to(torch::kCPU).to(torch::kFloat).item<float>(),
-				0.5f,		///!!!ПРИВЯЗАТЬСЯ К МАСШТАБУ для этого перенести в RunNetwork по аналогии с calculated_normals			//Get zoom_out_idx from scale //-1, 0, 1, 2 ... <- 1/2, 1, 2, 4 ...
-				CurrentImageIdx,
-				pyramid_embedder_properties,
-				cv::Size(Params.Views[CurrentImageIdx].W, Params.Views[CurrentImageIdx].H)
-			));
-		}
-	}		//if use_lerf
+		//Points for the pyramid: [B, 3] = (img_id, x=row, y=col) - same order as in PatchEmbeddingDataloader::operator()
+		auto coords = torch::stack({torch::full({ BatchSize }, static_cast<float>(CurrentImageIdx), torch::kFloat32).to(Device), rand_h.to(torch::kFloat32) * scale_h, rand_w.to(torch::kFloat32) * scale_w }, -1);
+
+		//Scale is sampled randomly per point (as in the original LeRF): an undefined tensor routes to RandomScales
+		auto [lang_embed_batch, scales_out] = (*PyramidClipEmbedding)(coords, torch::Tensor());
+		//scales_out holds the per-point tile-ratio scale; normalize it to [0,1] across the pyramid range so the field and renderer work in normalized pyramid-scale units
+		const auto &tile_sizes = PyramidClipEmbedding->GetTileSizesCPU();
+		const float t_min = tile_sizes[0].item<float>();
+		const float t_max = tile_sizes[tile_sizes.size(0) - 1].item<float>();
+		target_lerf_scale = (scales_out - t_min) / std::max(t_max - t_min, 1e-6f);
+
+		target_lang_embedding = lang_embed_batch/*.to(torch::kFloat32) done in PyramidClipEmbedding*/;
+	} //if use_lerf
 
 	//Проверяем завершение предзагрузки
 	if (LoadingFuture.valid())
@@ -203,6 +185,6 @@ NeRFDataExample NeRFDataset :: get_batch(std::vector<size_t> request/*Не ис�
 			PrefetchNextImage();		//Заново стартуем предзагрузку
 		}
 	}
-
-	return { {rays_o, rays_d, cone_angle, Params.Views[CurrentImageIdx].Near, Params.Views[CurrentImageIdx].Far}, {target_s, target_lang_embedding} };
+	return { {rays_o, rays_d, cone_angle, Params.Views[CurrentImageIdx].Near, Params.Views[CurrentImageIdx].Far}, {target_s, target_lang_embedding, target_lerf_scale,
+		static_cast<float>(Params.Views[CurrentImageIdx].H), static_cast<float>(Params.Views[CurrentImageIdx].K[1][1].item<float>())} };
 }

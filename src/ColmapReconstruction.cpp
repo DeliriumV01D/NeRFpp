@@ -231,7 +231,7 @@ std::pair<float, float> ComputeNearFarForImage(
 	const colmap::Camera &camera = reconstruction.Camera(image.CameraId());
 
 	//Позиция камеры в мировых координатах
-	Eigen::Vector3d camera_pos = image.CamFromWorld().translation;
+	Eigen::Vector3d camera_pos = image.ProjectionCenter();
 
 	for (const auto &point2D : image.Points2D())
 	{
@@ -354,7 +354,8 @@ NeRFDatasetParams LoadFromColmapReconstruction( const std::filesystem::path &wor
 		{
 			view.H = im.second.CameraPtr()->height;
 			view.W = im.second.CameraPtr()->width;
-			view.Focal = im.second.CameraPtr()->FocalLength();
+			const colmap::Camera &cam = *im.second.CameraPtr();
+			view.Focal = static_cast<float>(cam.FocalLengthIdxs().size() == 1 ? cam.params[cam.FocalLengthIdxs()[0]]: 0.5 * (cam.FocalLengthX() + cam.FocalLengthY()));
 			//Get intrinsic calibration matrix composed from focal length and principal point parameters, excluding distortion parameters.
 			//Eigen::Matrix3d CalibrationMatrix() const; in reconstruction.Cameras()
 			float kdata[] = { (float)im.second.CameraPtr()->FocalLengthX(), 0, (float)im.second.CameraPtr()->PrincipalPointX(),
@@ -383,8 +384,8 @@ NeRFDatasetParams LoadFromColmapReconstruction( const std::filesystem::path &wor
 
 	//result.BoundingBox = GetBbox3dForObj(result);		//(train_poses, result.H, result.W, /*near =*/ 2.0f, /*far =*/ 6.0f);
 	auto colmap_bb = reconstruction.ComputeBoundingBox(0.005, 0.995);
-	torch::Tensor min_bound = torch::tensor({ (float)colmap_bb.first.x(), (float)colmap_bb.first.y(), (float)colmap_bb.first.z() }),
-		max_bound = torch::tensor({ (float)colmap_bb.second.x(), (float)colmap_bb.second.y(), (float)colmap_bb.second.z() });
+	torch::Tensor min_bound = torch::tensor({ (float)colmap_bb.min().x(), (float)colmap_bb.min().y(), (float)colmap_bb.min().z() }),
+		max_bound = torch::tensor({ (float)colmap_bb.max().x(), (float)colmap_bb.max().y(), (float)colmap_bb.max().z() });
 	auto d = torch::norm(max_bound - min_bound);
 	result.BoundingBox = torch::cat({ min_bound - d * 0.01, max_bound + d * 0.01 }, -1);
 	std::cout << "result.BoundingBox: " << result.BoundingBox << std::endl;

@@ -29,6 +29,7 @@ inline std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> GetRays(const int
 		dirs.index({ "...", torch::indexing::None, torch::indexing::Slice() })
 		* c2w.index({ torch::indexing::Slice(torch::indexing::None, 3), torch::indexing::Slice(torch::indexing::None, 3) }),
 		-1);  //dot product, equals to : [c2w.dot(dir) for dir in dirs]
+	rays_d = torch::nn::functional::normalize(rays_d, torch::nn::functional::NormalizeFuncOptions().p(2).dim(-1));
 	//Translate camera frame's origin to the world frame. It is the origin of all rays.
 	auto rays_o = c2w.index({ torch::indexing::Slice(torch::indexing::None, 3), -1 }).expand(rays_d.sizes());
 
@@ -40,7 +41,7 @@ inline std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> GetRays(const int
 	auto pixel_size_y = 1.0 / fy;
 	auto avg_pixel_size = (pixel_size_x + pixel_size_y) / 2.0;
 	//Производная радиуса конуса = угловой размер пикселя. При расстоянии d, радиус конуса cone_ridius = d * pixel_size
-	auto cone_angle = avg_pixel_size /** torch::ones({ h, w, 1 }, rays_d.options())*/ * 1.1f;  //Небольшой запас для антиалиасинга;
+	auto cone_angle = avg_pixel_size /** torch::ones({ h, w, 1 }, rays_d.options())*/ * 1.05f;  //Небольшой запас для антиалиасинга;
 
 	return std::make_tuple(rays_o, rays_d, cone_angle);
 }
