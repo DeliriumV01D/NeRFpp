@@ -102,7 +102,8 @@ LeRFRenderResult LeRFRenderer :: RenderRays(
 	torch::Tensor lerf_scales /*= torch::Tensor()*/,					///Per-ray normalized pyramid scale (B,1); empty = eval default
 	const float lerf_image_height /*= 0.f*/,					///View height in pixels for world-scale conversion
 	const float lerf_focal_y /*= 0.f*/,						///View focal length fy in pixels
-	const std::vector<float> &lerf_sweep_scales_norm /*= {}*/					///Actual pyramid levels the field was trained on; empty = legacy hardcoded list
+	const std::vector<float> &lerf_sweep_scales_norm /*= {}*/,					///Actual pyramid levels the field was trained on; empty = legacy hardcoded list
+	const torch::Tensor &lerf_override_z_vals /*= {}*/					///Shared fine sample grid from the NeRF pass; empty = own importance sampling
 	) {
 	LeRFRenderResult lerf_result;
 	torch::Device device = ray_batch.device();		//Передать параметром??
@@ -163,11 +164,17 @@ LeRFRenderResult LeRFRenderer :: RenderRays(
 
 	if (n_importance > 0)
 	{
-		auto z_vals_mid = .5 * (z_vals.index({ "...", torch::indexing::Slice(1, torch::indexing::None) }) + z_vals.index({ "...", torch::indexing::Slice(torch::indexing::None, -1) }));
-		auto z_samples = SamplePDF(z_vals_mid, outputs1.WeightsLE.index({ "...", torch::indexing::Slice(1, -1) }), n_importance, perturb == 0.);
-		z_samples = z_samples.detach();
-		torch::Tensor z_indices;
-		std::tie(z_vals, z_indices) = torch::sort(torch::cat({ z_vals, z_samples }, -1), -1);
+		if (lerf_override_z_vals.defined() && lerf_override_z_vals.numel() != 0)
+		{
+			//The override grid is already the complete fine grid [B, n_samples + n_importance] (built and sorted by the NeRF pass)
+			z_vals = lerf_override_z_vals.to(device).to(torch::kFloat32).detach();
+		} else {
+			auto z_vals_mid = .5 * (z_vals.index({ "...", torch::indexing::Slice(1, torch::indexing::None) }) + z_vals.index({ "...", torch::indexing::Slice(torch::indexing::None, -1) }));
+			auto z_samples = SamplePDF(z_vals_mid, outputs1.WeightsLE.index({ "...", torch::indexing::Slice(1, -1) }), n_importance, perturb == 0.);
+			z_samples = z_samples.detach();
+			torch::Tensor z_indices;
+			std::tie(z_vals, z_indices) = torch::sort(torch::cat({ z_vals, z_samples }, -1), -1);
+		}
 		pts = rays_o.index({ "...", torch::indexing::None, torch::indexing::Slice() }) + rays_d.index({ "...", torch::indexing::None, torch::indexing::Slice() }) * z_vals.index({ "...", torch::indexing::Slice(), torch::indexing::None }); // [N_rays, N_samples + N_importance, 3]
 		pts = TangentScatter(pts, z_vals, near, cone_angle, rays_d, device, bounding_box);
 
@@ -263,7 +270,8 @@ LeRFRenderResult LeRFRenderer :: BatchifyRays(
 	const float lerf_image_height /*= 0.f*/,					///View height in pixels for world-scale conversion
 	const float lerf_focal_y /*= 0.f*/,						///View focal length fy in pixels
 	const std::function<bool()> &is_aborted /*= {}*/,			///Cancellation hook polled between batches; return true to abort
-	const std::vector<float> &lerf_sweep_scales_norm /*= {}*/					///Actual pyramid levels the field was trained on; empty = legacy hardcoded list
+	const std::vector<float> &lerf_sweep_scales_norm /*= {}*/,					///Actual pyramid levels the field was trained on; empty = legacy hardcoded list
+	const torch::Tensor &lerf_override_z_vals /*= {}*/					///Shared fine sample grid from the NeRF pass; empty = own importance sampling
 ) {
 	LeRFRenderResult result;
 	std::vector<LeRFRenderResult> all_results;
@@ -294,7 +302,10 @@ LeRFRenderResult LeRFRenderer :: BatchifyRays(
 				: torch::Tensor(),
 			lerf_image_height,
 			lerf_focal_y,
-			lerf_sweep_scales_norm
+			lerf_sweep_scales_norm,
+			(lerf_override_z_vals.defined() && lerf_override_z_vals.numel() != 0) 
+				? lerf_override_z_vals.index({ torch::indexing::Slice(i, ((i + chunk) <= lerf_override_z_vals.sizes()[0]) ? (i + chunk) : lerf_override_z_vals.sizes()[0]), torch::indexing::Slice() })
+				: torch::Tensor()
 		));
 		//Pacing (interactive only): wait until the GPU has actually executed this chunk.
 		//Without it the host enqueues the whole level in microseconds and blocks in the
@@ -392,7 +403,7 @@ LeRFRenderResult LeRFRenderer :: Render(
 	LeRFRenderResult all_ret = std::move(BatchifyRays(
 		rays_, render_params.ThinRay ? torch::Tensor() : cone_angle, render_params.NSamples, render_params.Chunk, render_params.ReturnRaw, render_params.LinDisp, render_params.Perturb,
 		render_params.NImportance, render_params.WhiteBkgr, render_params.RawNoiseStd, render_params.StochasticPreconditioningAlpha, render_params.BoundingBox, render_params.ReturnWeights,
-		render_params.LeRFScales, sweep_height, sweep_fy, is_aborted, render_params.LeRFSweepScalesNorm
+		render_params.LeRFScales, sweep_height, sweep_fy, is_aborted, render_params.LeRFSweepScalesNorm, render_params.LeRFOverrideZVals
 	));
 
 	//A partial (aborted) result has fewer rows than h*w; reshaping it to the full image would throw

@@ -22,9 +22,7 @@ public:
 		Primes,
 		Biases,
 		FeatLocalSize,
-		FeatLocalIdx,
-		QueryPoints,
-		QueryVolumeIdx;
+		FeatLocalIdx;
 
 
 	//torch::nn::ModuleList GetEmbeddings() const { return Embeddings; }
@@ -60,6 +58,9 @@ TORCH_MODULE(CuHashEmbedder);
 class CuHashEmbedderInfo : public torch::CustomClassHolder {
 public:
 	CuHashEmbedderImpl * HashEmbedder = nullptr;
+	///Per-call query state travels with this object through ctx->saved_data so each backward reads the points of its own forward call; the former embedder members were overwritten whenever
+	torch::Tensor QueryPoints,
+		QueryVolumeIdx;
 };
 
 namespace torch::autograd {

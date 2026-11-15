@@ -231,12 +231,16 @@ std::pair<torch::Tensor, torch::Tensor> PyramidEmbeddingDataloader :: RandomScal
 	torch::Tensor bottom_interp = torch::zeros({ B, D }, torch::TensorOptions().dtype(torch::kHalf).device(Device));
 	torch::Tensor top_interp = torch::zeros({ B, D }, torch::TensorOptions().dtype(torch::kHalf).device(Device));
 
-	//Цикл по уровням (нужно оптимизировать в будущем)
-	for (int64_t level = 0; level < NumLevels - 1; level++) 
+	//group points by level with one sync (bincount) instead of a .any().item<bool>() sync per level;
+	//the per-level zero/nonzero split below is a pure-GPU re-derivation of the same ids
+	torch::Tensor counts = torch::bincount(random_bin, /*weights=*/{}, NumLevels - 1);
+	auto counts_cpu = counts.cpu();
+	auto counts_acc = counts_cpu.accessor<int64_t, 1>();
+	for (int64_t level = 0; level < NumLevels - 1; level++)
 	{
+		if (counts_acc[level] == 0) continue;		//empty level: skip without touching the GPU
 		//Индексы точек, для которых этот уровень "нижний"
 		torch::Tensor mask = (random_bin == level);
-		if (!mask.any().item<bool>()) continue;
 
 		//Получаем индексы подмножества
 		torch::Tensor ids = mask.nonzero().squeeze(1); // [M]
@@ -306,12 +310,15 @@ std::pair<torch::Tensor, torch::Tensor> PyramidEmbeddingDataloader :: UniformSca
 	int64_t D = Levels[0]->GetData().size(-1); //embed_size
 	torch::Tensor result = torch::zeros({ B, D }, torch::TensorOptions().dtype(torch::kFloat32).device(Device));
 
-	//Group points by bin: one call per level instead of B GPU syncs (same strategy as RandomScales)
-	for (int64_t level = 0; level < NumLevels - 1; ++level)
+	//single-sync level grouping, same as RandomScales
+	torch::Tensor counts = torch::bincount(bin, /*weights=*/{}, NumLevels - 1);
+	auto counts_cpu = counts.cpu();
+	auto counts_acc = counts_cpu.accessor<int64_t, 1>();
+	for (int64_t level = 0; level < NumLevels - 1; level++)
 	{
-		torch::Tensor mask = (bin == level);
-		if (!mask.any().item<bool>()) continue;
+		if (counts_acc[level] == 0) continue;
 
+		torch::Tensor mask = (bin == level);
 		torch::Tensor ids = mask.nonzero().squeeze(1); // [M]
 		torch::Tensor points_slice = pts.index({ ids });
 

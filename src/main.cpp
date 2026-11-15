@@ -182,7 +182,7 @@ int main(int argc, const char* argv[])
 	exparams.use_viewdirs = true;	//use full 5D input instead of 3D Не всегда нужна зависимость от направления обзора + обучение быстрее процентов на 30.
 	exparams.calculate_normals = false;
 	exparams.use_pred_normal = false;	//whether to use predicted normals
-	exparams.use_lerf = true;				//use language embedded radiance fields
+	exparams.use_lerf = false;				//use language embedded radiance fields
 	exparams.thin_ray = false;
 	exparams.multires_views = 8;		//log2 of max freq for positional encoding (2D direction)
 	exparams.n_importance = 192;//192;		//number of additional fine samples per ray

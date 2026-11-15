@@ -76,9 +76,8 @@ inline cv::Mat ComposeRelevancyOverRGB(const torch::Tensor &relevancy, const tor
 	}
 
 	auto p = torch::clamp(rel - 0.5, 0.0, 1.0);			//Original lerf threshold
-	const float p_max = p.max().item<float>();
+	const float p_max = std::max(p.max().item<float>(), 0.25f);			//strong frames (p_max>=0.25) are unchanged
 
-	//Base layer: the RGB render via the standard conversion
 	cv::Mat base = TorchTensorToCVMat(rgb);
 
 	//Nothing above the threshold: the pure RGB render
@@ -88,17 +87,18 @@ inline cv::Mat ComposeRelevancyOverRGB(const torch::Tensor &relevancy, const tor
 	//Above the threshold: colormap of p / max(p) alpha-blended over the RGB base
 	auto alpha2d = p.div(p_max).clamp(0.f, 1.f);	//[H, W] in [0, 1]
 	auto gray8 = alpha2d.mul(255).to(torch::kU8).contiguous();
-	cv::Mat gray(static_cast<int>(H), static_cast<int>(W), CV_8UC1, gray8.data_ptr()), jet;
-	cv::applyColorMap(gray, jet, cv::COLORMAP_JET);
+	cv::Mat gray(static_cast<int>(H), static_cast<int>(W), CV_8UC1, gray8.data_ptr()),
+		colormap;
+	cv::applyColorMap(gray, colormap, cv::COLORMAP_JET);
 
 	//Opacity cap: even at peak relevancy the colormap stays at most alpha_max opaque, so the RGB underlay always shows through noticeably
-	const float alpha_max = 0.65f;			//(0.65 = 65% JET / 35% RGB)
+	const float alpha_max = 0.65f;			//(0.65 = 65% Relevancy / 35% RGB)
 
-	//Translucent blend in float space: out = base + alpha * (jet - base), alpha capped at alpha_max
+	//Translucent blend in float space: out = base + alpha * (colormap - base), alpha capped at alpha_max
 	auto alpha = alpha2d.mul(alpha_max).unsqueeze(-1).expand({ H, W, 3 }).contiguous();
-	auto jet_t = torch::from_blob(jet.data, { H, W, 3 }, torch::kU8).to(torch::kFloat32).div(255.);
+	auto colormap_t = torch::from_blob(colormap.data, { H, W, 3 }, torch::kU8).to(torch::kFloat32).div(255.);
 	auto base_t = torch::from_blob(base.data, { H, W, 3 }, torch::kU8).to(torch::kFloat32).div(255.);
-	auto blended = base_t.add(alpha.mul(jet_t.sub(base_t))).mul(255).clamp(0, 255).to(torch::kU8).contiguous();
+	auto blended = base_t.add(alpha.mul(colormap_t.sub(base_t))).mul(255).clamp(0, 255).to(torch::kU8).contiguous();
 	return cv::Mat(static_cast<int>(H), static_cast<int>(W), CV_8UC3, blended.data_ptr()).clone();
 }
 
@@ -153,7 +153,8 @@ public:
 		torch::Tensor lerf_scales = torch::Tensor(),			///Per-ray normalized pyramid scale (B,1); empty = eval default
 		const float lerf_image_height = 0.f,			///View height in pixels for world-scale conversion
 		const float lerf_focal_y = 0.f,			///View focal length fy in pixels
-		const std::vector<float> &lerf_sweep_scales_norm = {}			///Actual pyramid levels the field was trained on; empty = legacy hardcoded list
+		const std::vector<float> &lerf_sweep_scales_norm = {},			///Actual pyramid levels the field was trained on; empty = legacy hardcoded list
+		const torch::Tensor &lerf_override_z_vals = {}			///Shared fine sample grid from the NeRF pass; empty = own importance sampling
 	);
 
 	///Render rays in smaller minibatches to save memory
@@ -176,7 +177,8 @@ public:
 		const float lerf_image_height = 0.f,			///View height in pixels for world-scale conversion
 		const float lerf_focal_y = 0.f,			///View focal length fy in pixels
 		const std::function<bool()> &is_aborted = {},			///Cancellation hook
-		const std::vector<float> &lerf_sweep_scales_norm = {}			///Actual pyramid levels the field was trained on; empty = legacy hardcoded list
+		const std::vector<float> &lerf_sweep_scales_norm = {},			///Actual pyramid levels the field was trained on; empty = legacy hardcoded list
+		const torch::Tensor &lerf_override_z_vals = {}			///Shared fine sample grid from the NeRF pass; empty = own importance sampling
 	);
 
 	///Если определены позиции c2w то rays не нужен т.к.не используется (задавать либо pose c2w либо rays)

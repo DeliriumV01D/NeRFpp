@@ -225,8 +225,8 @@ variable_list CuHashEmbedderFunction::forward(
 ) {
 	auto info_ptr = hash3d_info.toCustomClass<CuHashEmbedderInfo>();
 	ctx->saved_data["cu_hash_embedder_info"] = hash3d_info;
-	torch::Tensor &points  = info_ptr->HashEmbedder->QueryPoints;                       // [ n_points, 3 ]
-	torch::Tensor &volume_idx = info_ptr->HashEmbedder->QueryVolumeIdx;                // [ n_points, 1 ]
+	torch::Tensor &points  = info_ptr->QueryPoints;                       // [ n_points, 3 ]
+	torch::Tensor &volume_idx = info_ptr->QueryVolumeIdx;                // [ n_points, 1 ]
 	torch::Tensor &prim_pool = info_ptr->HashEmbedder->Primes;
 	torch::Tensor &bias_pool = info_ptr->HashEmbedder->Biases;
 	torch::Tensor &feat_local_idx = info_ptr->HashEmbedder->FeatLocalIdx;
@@ -277,8 +277,8 @@ variable_list CuHashEmbedderFunction::forward(
 variable_list CuHashEmbedderFunction::backward(AutogradContext* ctx, variable_list grad_output) 
 {
 	auto info_ptr = ctx->saved_data["cu_hash_embedder_info"].toCustomClass<CuHashEmbedderInfo>();
-	Tensor& points  = info_ptr->HashEmbedder->QueryPoints;							// [ n_points, 3 ]
-	Tensor& volume_idx = info_ptr->HashEmbedder->QueryVolumeIdx;
+	Tensor& points  = info_ptr->QueryPoints;							// [ n_points, 3 ]
+	Tensor& volume_idx = info_ptr->QueryVolumeIdx;
 	Tensor& prim_pool = info_ptr->HashEmbedder->Primes;
 	Tensor& bias_pool = info_ptr->HashEmbedder->Biases;
 	Tensor& feat_local_idx = info_ptr->HashEmbedder->FeatLocalIdx;

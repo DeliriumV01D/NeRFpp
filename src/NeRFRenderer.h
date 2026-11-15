@@ -16,7 +16,8 @@ struct NeRFRendererOutputs {
 		DispMap,		///[num_rays] .Disparity map.Inverse of depth map.
 		AccMap,			///[num_rays] .Sum of weights along each ray.
 		Weights,		///[num_rays, num_samples] .Weights assigned to each sampled color.
-		DepthMap;		///[num_rays] .Estimated distance to object.
+		DepthMap,		///[num_rays] .Estimated distance to object.
+		ZVals;		///[num_rays, n_samples(+n_importance)] .Sample distances along each ray (fine grid when n_importance>0, else coarse); exported so the LeRF pass can share the same sample grid
 };
 
 struct NeRFRenderResult
@@ -50,6 +51,9 @@ struct NeRFRenderParams {
 	///training formula s_norm = (level - t_min) / (t_max - t_min) (identical to NeRFDataset::get_batch).
 	///Empty -> the renderer falls back to its legacy hardcoded 4-point sweep list.
 	std::vector<float> LeRFSweepScalesNorm;
+	///Shared fine sample grid from the NeRF pass (training only): the LeRF renderer reuses these z_vals
+	///instead of its own importance sampling so both grids describe the same 3D points. Empty = own sampling.
+	torch::Tensor LeRFOverrideZVals{torch::Tensor()};
 	float StochasticPreconditioningAlpha{0};	///добавляет шум к входу сети (координатам точек). Уменьшает чувствительность к инициализации. Помогает избежать "плавающих" артефактов
 };
 
@@ -470,6 +474,9 @@ NeRFRenderResult NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: RenderRays(
 		else
 			result.Outputs = outputs1;
 
+	//Sample grid export (shared-grid training): z_vals here is the fine grid when n_importance>0, else the coarse one
+	result.Outputs.ZVals = z_vals;
+
 	if (return_raw)
 		result.Raw = raw;
 
@@ -538,6 +545,7 @@ NeRFRenderResult NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: BatchifyRays(
 		out_acc_map,
 		out_weights,
 		out_depth_map,
+		out_z_vals,
 		raw;
 	for (auto it : all_results)
 	{
@@ -546,6 +554,7 @@ NeRFRenderResult NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: BatchifyRays(
 		if (it.Outputs.AccMap.defined()) out_acc_map.push_back(it.Outputs.AccMap);
 		if (it.Outputs.Weights.defined()) out_weights.push_back(it.Outputs.Weights);
 		if (it.Outputs.DepthMap.defined()) out_depth_map.push_back(it.Outputs.DepthMap);
+		if (it.Outputs.ZVals.defined()) out_z_vals.push_back(it.Outputs.ZVals);
 		if (it.Raw.defined()) raw.push_back(it.Raw);
 	}
 	if (!out_rgb_map.empty()) result.Outputs.RGBMap = torch::cat(out_rgb_map, 0);
@@ -553,6 +562,7 @@ NeRFRenderResult NeRFRenderer<TEmbedder, TEmbedDirs, TNeRF> :: BatchifyRays(
 	if (!out_acc_map.empty()) result.Outputs.AccMap = torch::cat(out_acc_map, 0);
 	if (!out_weights.empty()) result.Outputs.Weights = torch::cat(out_weights, 0);
 	if (!out_depth_map.empty()) result.Outputs.DepthMap = torch::cat(out_depth_map, 0);
+	if (!out_z_vals.empty()) result.Outputs.ZVals = torch::cat(out_z_vals, 0);
 	if (!raw.empty()) result.Raw = torch::cat(raw, 0);
 
 	return result;

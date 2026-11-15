@@ -93,8 +93,8 @@ std::pair<torch::Tensor, torch::Tensor> CuHashEmbedderImpl :: forward(torch::Ten
 	//if (!torch::all(xyz <= box_max) || !torch::all(xyz >= box_min))
 	x = torch::clamp(x, box_min, box_max);
 
-	QueryPoints = x.contiguous();//((x + 1.f) * .5f).contiguous();   // [-1, 1] -> [0, 1]		[ n_points, 3 ]
-	QueryVolumeIdx = torch::zeros({QueryPoints.sizes()[0], 1}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA)).contiguous();// = anchors.contiguous();		//[ n_points, 1 ]
+	info->QueryPoints = x.contiguous();//((x + 1.f) * .5f).contiguous();   // [-1, 1] -> [0, 1]		[ n_points, 3 ]
+	info->QueryVolumeIdx = torch::zeros({info->QueryPoints.sizes()[0], 1}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA)).contiguous();// = anchors.contiguous();		//[ n_points, 1 ]
 	info->HashEmbedder = this;
 	auto x_embedded_all = torch::autograd::CuHashEmbedderFunction::apply(Embeddings, torch::IValue(info))[0];  // [n_points, n_levels * n_channels];
 

@@ -106,8 +106,8 @@ PatchEmbeddingDataloader :: PatchEmbeddingDataloader(
 	auto center_x = torch::arange(num_centers_x, torch::kFloat64) * stride_ + (kernel_size_ - 1) / 2.0 - padding_;
 	auto center_y = torch::arange(num_centers_y, torch::kFloat64) * stride_ + (kernel_size_ - 1) / 2.0 - padding_;
 
-	center_x_ = center_x.to(torch::kHalf);
-	center_y_ = center_y.to(torch::kHalf);
+	center_x_ = center_x.to(torch::kFloat32);
+	center_y_ = center_y.to(torch::kFloat32);
 	start_x_ = center_x_[0].to(torch::kFloat).item<float>();
 	start_y_ = center_y_[0].to(torch::kFloat).item<float>();
 

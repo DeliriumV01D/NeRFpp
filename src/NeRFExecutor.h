@@ -46,7 +46,8 @@ struct NeRFExecutorParams
 		calculate_normals{ false },
 		use_pred_normal{ false },	//whether to use predicted normals
 		use_lerf{ true },
-		thin_ray{ false };
+		thin_ray{ false },
+		white_bkgr{ false };		//composite over white background (paper NeRF; for datasets with white bkgd)
 	int n_levels{ 16 },											//for color density embedder
 		n_features_per_level{ 2 },						//for color density embedder
 		log2_hashmap_size{ 19 },							//for color density embedder
@@ -415,8 +416,8 @@ NeRFRenderParams * NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TL
 	render_params->Chunk = executor_train_params.Chunk;
 	render_params->ReturnRaw = executor_train_params.ReturnRaw;
 	render_params->LinDisp = executor_train_params.LinDisp;
-	render_params->Perturb = 0.f;
-	//render_params.WhiteBkgr = params.WhiteBkgr;
+	render_params->Perturb = (iter == std::numeric_limits<int>::max()) ? 0.f : 1.f;		//Stratified sampling jitter for training; deterministic (0) for inference/test renders
+	render_params->WhiteBkgr = executor_params.white_bkgr;
 	render_params->RawNoiseStd = 0.;
 	render_params->Ndc = executor_train_params.Ndc;
 	render_params->UseViewdirs = UseViewDirs;
@@ -694,12 +695,18 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 	//std::vector<torch::Tensor> rgbs,
 	//	disps;
 
+	torch::Tensor k1 = k.clone().detach();
 	if (rparams.RenderFactor != 0)
 	{
 		//Render downsampled for speed
 		h = h / rparams.RenderFactor;
 		w = w / rparams.RenderFactor;
 		focal = focal / rparams.RenderFactor;
+		//Scale the intrinsics together with the image (same as RenderView)
+		k1[0][0] = k1[0][0]/rparams.RenderFactor;
+		k1[1][1] = k1[1][1]/rparams.RenderFactor;
+		k1[0][2] = k1[0][2]/rparams.RenderFactor;
+		k1[1][2] = k1[1][2]/rparams.RenderFactor;
 	}
 
 	for (size_t i = 0; i < render_poses.size(); i++)		//(auto &c2w : render_poses) //
@@ -707,7 +714,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 		torch::Tensor rgb_map;
 		if (Params.use_nerf)
 		{
-			auto render_result = std::move(NeRFRenderer->Render(h, w, k,
+			auto render_result = std::move(NeRFRenderer->Render(h, w, k1,
 				rparams,
 				rays,
 				render_poses[i].index({ torch::indexing::Slice(torch::indexing::None, 3), torch::indexing::Slice(torch::indexing::None, 4) }),
@@ -730,7 +737,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 
 		if (Params.use_lerf)
 		{
-			auto render_result = std::move(LeRFRenderer->Render(h, w, k,
+			auto render_result = std::move(LeRFRenderer->Render(h, w, k1,
 				rparams,
 				rays,
 				render_poses[i].index({ torch::indexing::Slice(torch::indexing::None, 3), torch::indexing::Slice(torch::indexing::None, 4) }), c2w_staticcam));
@@ -883,6 +890,7 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 		torch::Tensor loss = torch::full({ 1/*img_loss.sizes()*/ }, 0.f).to(Device),
 			psnr = torch::full({ 1/*img_loss.sizes()*/ }, 10.f).to(Device);
 		torch::Tensor nerf_weights;		//Frozen-NeRF weights snapshot: reference for the LeRF percentile selection and sigma_le distillation (no LeRF->NeRF backprop)
+		torch::Tensor nerf_fine_z_vals;		//Fine sample grid of the same pass: handed to the LeRF render so both fields evaluate the same 3D points
 		if (Params.use_nerf)
 		{
 			std::unique_ptr<NeRFRenderParams> render_params(FillRenderParams(Params, params, i, data.BoundingBox, true, Params.calculate_normals || Params.use_pred_normal));
@@ -938,6 +946,8 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 			//sigma_le distillation (detach: no LeRF->NeRF backprop)
 			if (rgb_disp_acc_extras.Outputs.Weights.defined() && rgb_disp_acc_extras.Outputs.Weights.numel() != 0)
 				nerf_weights = rgb_disp_acc_extras.Outputs.Weights.detach();
+			if (rgb_disp_acc_extras.Outputs.ZVals.defined() && rgb_disp_acc_extras.Outputs.ZVals.numel() != 0)
+				nerf_fine_z_vals = rgb_disp_acc_extras.Outputs.ZVals.detach();
 			loss.backward();
 		}		//if use_nerf
 
@@ -980,6 +990,9 @@ void NeRFExecutor <TEmbedder, TEmbedDirs, TNeRF, TNeRFRenderer, TLeRFEmbedder, T
 			render_params->LeRFScales = batch.target.target_lerf_scale;
 			render_params->LeRFImageHeight = batch.target.target_image_height;
 			render_params->LeRFFocalY = batch.target.target_focal_y;
+			//Shared fine sample grid: LeRF reuses the frozen NeRF fine z_vals when available
+			if (nerf_fine_z_vals.defined() && nerf_fine_z_vals.numel() != 0)
+				render_params->LeRFOverrideZVals = nerf_fine_z_vals;
 			auto lerf_render_result = std::move(LeRFRenderer->Render(0, 0, torch::Tensor(),/*либо rays либо data.H, data.W, data.K,*/
 				*render_params, { batch.data.rays_o, batch.data.rays_d, batch.data.cone_angle }, torch::Tensor(), torch::Tensor()				/*либо rays либо pose c2w*/
 			));
